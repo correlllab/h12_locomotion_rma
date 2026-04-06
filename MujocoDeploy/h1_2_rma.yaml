@@ -1,0 +1,69 @@
+# ============================================================
+# H1-2 RMA Phase 1 — MuJoCo deployment config
+# ============================================================
+# Policy: LSTM (ActorCriticRecurrent) trained in Isaac Gym
+# Encoder: MLP 9 -> 8 (forces-only e_t)
+# Obs: 47 (env) + 8 (z_t) = 55 actor input per LSTM step
+# ============================================================
+
+# --- Paths (relative to this yaml) ---
+policy_path: "exported_weights/policy.pt"
+encoder_path: "exported_weights/encoder.pt"
+xml_path: "h1_2/scene.xml"
+
+# --- Simulation ---
+simulation_duration: 60.0
+simulation_dt: 0.0025          # must match Isaac Gym sim dt
+control_decimation: 8          # policy runs every 8 substeps = 0.02s
+
+# --- PD gains (legs) — match Isaac Gym training config ---
+num_actions: 12
+kps: [200, 200, 200, 300, 40, 40,
+      200, 200, 200, 300, 40, 40]
+kds: [2.5, 2.5, 2.5, 4.0, 2.0, 2.0,
+      2.5, 2.5, 2.5, 4.0, 2.0, 2.0]
+
+# --- PD gains (upper body — hold at defaults) ---
+kps_arms: [200,
+           50, 50, 50, 50, 20, 20, 20,
+           50, 50, 50, 50, 20, 20, 20]
+kds_arms: [5.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+
+# --- Default joint angles (legs, DOF order from URDF) ---
+# yaw, pitch, roll, knee, ankle_pitch, ankle_roll  x2
+default_angles: [0.0, -0.16, 0.0, 0.36, -0.2, 0.0,
+                 0.0, -0.16, 0.0, 0.36, -0.2, 0.0]
+
+# --- Default joint angles (upper body: torso + arms) ---
+default_angles_arms: [0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+
+# --- Observation scaling (must match Isaac Gym) ---
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+
+# --- Gait phase ---
+phase_period: 0.8              # seconds per gait cycle
+
+# --- Commands (vx, vy, yaw_rate) ---
+cmd_init: [0.5, 0.0, 0.0]     # walk forward at 0.5 m/s
+
+# --- RMA forces (world frame, Newtons) ---
+# These are applied to torso_link, left_wrist_roll_link, right_wrist_roll_link
+# Set to [0,0,0] for no force. Change to test robustness.
+torso_force: [0.0, 0.0, 0.0]
+left_wrist_force: [0.0, 0.0, 0.0]
+right_wrist_force: [0.0, 0.0, 0.0]
+
+# Force schedule: apply forces starting at this time (seconds)
+force_start_time: 3.0
+
+# --- RMA architecture (for reconstructing encoder) ---
+rma_et_dim: 9
+rma_latent_dim: 8

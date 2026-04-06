@@ -1,0 +1,115 @@
+# ============================================================
+# RMA Force Sweep — Robustness Evaluation Config
+# ============================================================
+# Tests the trained policy across a grid of external forces
+# applied to torso, left wrist, and right wrist.
+#
+# Two sweep modes:
+#   1. axis_sweep: force along ±X, ±Y, ±Z at each magnitude
+#   2. spherical_sweep: N random directions at each magnitude
+#
+# Metrics collected per trial:
+#   - survival_time (s) — fall = base height < threshold
+#   - success (bool) — survived >= eval_duration
+#   - tracking_rmse_xy — RMS velocity tracking error (m/s)
+#   - mean_orientation_error — mean projected gravity deviation
+# ============================================================
+
+# --- Policy / model (same as h1_2_rma.yaml) ---
+policy_path: "exported_weights/policy.pt"
+encoder_path: "exported_weights/encoder.pt"
+xml_path: "h1_2/scene.xml"
+
+# Or use a direct checkpoint (overrides policy_path/encoder_path):
+# ckpt_path: "../logs/h1_2_rma/Apr05_19-19-47_/model_5000.pt"
+
+# --- Simulation params (must match training) ---
+simulation_dt: 0.0025
+control_decimation: 8
+num_actions: 12
+rma_et_dim: 9
+rma_latent_dim: 8
+
+# --- PD gains (legs) ---
+kps: [200, 200, 200, 300, 40, 40,
+      200, 200, 200, 300, 40, 40]
+kds: [2.5, 2.5, 2.5, 4.0, 2.0, 2.0,
+      2.5, 2.5, 2.5, 4.0, 2.0, 2.0]
+
+# --- PD gains (upper body) ---
+kps_arms: [200,
+           50, 50, 50, 50, 20, 20, 20,
+           50, 50, 50, 50, 20, 20, 20]
+kds_arms: [5.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+
+# --- Default joint angles ---
+default_angles: [0.0, -0.16, 0.0, 0.36, -0.2, 0.0,
+                 0.0, -0.16, 0.0, 0.36, -0.2, 0.0]
+default_angles_arms: [0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+
+# --- Observation scaling ---
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+phase_period: 0.8
+
+# ============================================================
+# SWEEP PARAMETERS
+# ============================================================
+
+eval:
+  duration: 10.0             # seconds per trial
+  fall_height: 0.5           # base height below this = fallen (m)
+  force_start_time: 1.0      # apply forces after robot stabilizes (s)
+  cmd: [0.5, 0.0, 0.0]      # velocity command during eval [vx, vy, yaw]
+  tracking_warmup: 2.0       # ignore tracking error before this time (s)
+
+# --- Which bodies to sweep ---
+# Each body is swept independently first, then combined sweeps run.
+sweep_bodies:
+  - name: torso
+    label: "Torso"
+  - name: left_wrist
+    label: "Left Wrist"
+  - name: right_wrist
+    label: "Right Wrist"
+
+# --- Force magnitudes to test (Newtons) ---
+magnitudes: [0, 2, 5, 8, 10, 15, 20, 25, 30]
+
+# --- Sweep mode ---
+# "axis": test along ±X, ±Y, ±Z (6 directions per magnitude)
+# "spherical": test N random directions per magnitude
+# "both": run axis + spherical
+sweep_mode: "axis"
+
+# For spherical mode: number of random directions per magnitude
+spherical_n_samples: 10
+spherical_seed: 42
+
+# --- Combined sweeps (all 3 bodies at once) ---
+# Each entry specifies [torso_mag, left_mag, right_mag]
+# and directions are sampled spherically.
+combined_sweeps:
+  - [5, 5, 5]
+  - [10, 5, 5]
+  - [10, 10, 10]
+  - [15, 10, 10]
+  - [20, 10, 10]
+  - [20, 15, 15]
+combined_n_samples: 5         # random direction samples per combo
+combined_seed: 123
+
+# --- Baseline comparison ---
+# Also run with no_encode (z_t=0) at selected magnitudes
+baseline_no_encode: true
+baseline_magnitudes: [0, 5, 10, 15, 20]
+
+# --- Output ---
+output_dir: "sweep_results"

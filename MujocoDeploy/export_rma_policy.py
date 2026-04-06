@@ -23,6 +23,24 @@ from rsl_rl.modules import ActorCriticRecurrent
 from rma.env_factor_encoder import EnvFactorEncoder, EnvFactorEncoderCfg
 
 
+def _remap_state_dict(model, state_dict):
+    """Remap keys between rsl_rl versions (actor.0.weight <-> actor.layers.0.weight)."""
+    model_keys = set(model.state_dict().keys())
+    if set(state_dict.keys()) == model_keys:
+        return state_dict
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+        for prefix in ("actor.", "critic."):
+            layers_prefix = prefix.replace(".", ".layers.")
+            if k.startswith(prefix) and layers_prefix not in k and k.replace(prefix, layers_prefix, 1) in model_keys:
+                new_k = k.replace(prefix, layers_prefix, 1)
+            elif layers_prefix in k and k.replace(layers_prefix, prefix, 1) in model_keys:
+                new_k = k.replace(layers_prefix, prefix, 1)
+        remapped[new_k] = v
+    return remapped
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export RMA policy + encoder from training checkpoint")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model_<iter>.pt checkpoint")
@@ -64,7 +82,8 @@ def main():
 
     # Verify by loading into model
     model = ActorCriticRecurrent(**policy_cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
+    sd = _remap_state_dict(model, ckpt["model_state_dict"])
+    model.load_state_dict(sd)
     model.eval()
     print(f"  Policy loaded OK: actor_obs={args.num_actor_obs}, actions={args.num_actions}, "
           f"LSTM({args.num_actor_obs}, {args.rnn_hidden_size})")

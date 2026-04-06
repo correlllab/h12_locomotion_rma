@@ -87,6 +87,43 @@ def pd_control(target_q, q, kp, dq, kd):
 #  Model loading
 # ──────────────────────────────────────────────────────────────
 
+def _remap_state_dict(model, state_dict):
+    """Remap state dict keys to handle rsl_rl version differences.
+
+    Training rsl_rl uses nn.Sequential directly:   actor.0.weight, actor.2.weight, ...
+    Some rsl_rl versions wrap in SimpleMLP:         actor.layers.0.weight, ...
+    This function adapts whichever direction is needed.
+    """
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+
+    # Check if remapping is needed
+    if model_keys == ckpt_keys:
+        return state_dict
+
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+        # ckpt has "actor.0.weight" but model wants "actor.layers.0.weight"
+        if k.startswith("actor.") and "actor.layers." not in k and k.replace("actor.", "actor.layers.") in model_keys:
+            new_k = k.replace("actor.", "actor.layers.", 1)
+        elif k.startswith("critic.") and "critic.layers." not in k and k.replace("critic.", "critic.layers.") in model_keys:
+            new_k = k.replace("critic.", "critic.layers.", 1)
+        # ckpt has "actor.layers.0.weight" but model wants "actor.0.weight"
+        elif "actor.layers." in k and k.replace("actor.layers.", "actor.") in model_keys:
+            new_k = k.replace("actor.layers.", "actor.", 1)
+        elif "critic.layers." in k and k.replace("critic.layers.", "critic.") in model_keys:
+            new_k = k.replace("critic.layers.", "critic.", 1)
+        remapped[new_k] = v
+
+    mismatched = set(remapped.keys()) - model_keys
+    if mismatched:
+        print(f"Warning: still mismatched keys after remap: {mismatched}")
+    else:
+        print("  State dict keys remapped for rsl_rl version compatibility")
+    return remapped
+
+
 def load_policy_and_encoder(cfg, ckpt_path=None, device="cpu"):
     """Load ActorCriticRecurrent + EnvFactorEncoder.
 
@@ -105,7 +142,8 @@ def load_policy_and_encoder(cfg, ckpt_path=None, device="cpu"):
             activation="elu",
         )
         policy = ActorCriticRecurrent(**policy_cfg)
-        policy.load_state_dict(ckpt["model_state_dict"])
+        sd = _remap_state_dict(policy, ckpt["model_state_dict"])
+        policy.load_state_dict(sd)
 
         enc_cfg = EnvFactorEncoderCfg(
             in_dim=cfg.get("rma_et_dim", 9),
@@ -119,7 +157,8 @@ def load_policy_and_encoder(cfg, ckpt_path=None, device="cpu"):
         # Load from exported files
         pol_data = torch.load(cfg["policy_path"], map_location=device)
         policy = ActorCriticRecurrent(**pol_data["cfg"])
-        policy.load_state_dict(pol_data["model_state_dict"])
+        sd = _remap_state_dict(policy, pol_data["model_state_dict"])
+        policy.load_state_dict(sd)
 
         enc_data = torch.load(cfg["encoder_path"], map_location=device)
         encoder = EnvFactorEncoder(EnvFactorEncoderCfg(**enc_data["cfg"]))

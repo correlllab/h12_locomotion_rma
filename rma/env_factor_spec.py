@@ -11,12 +11,13 @@ from dataclasses import dataclass
 
 
 # Force: spherical sampling. Magnitude in [0, max] (N); direction uniform on unit sphere.
-FORCE_MAGNITUDE_RANGE: tuple[float, float] = (0.0, 10.0)  # N
-# Per-axis range for decoder output scaling
-FORCE_COMPONENT_RANGE: tuple[float, float] = (-10.0, 10.0)
+FORCE_MAGNITUDE_RANGE: tuple[float, float] = (0.0, 100.0)  # N
+# Per-axis range used to normalize e_t to [-1, 1] before encoder input.
+# Must equal max force magnitude so that ±max along any axis maps to ±1.
+FORCE_COMPONENT_RANGE: tuple[float, float] = (-100.0, 100.0)
 
 # Per-step resample probability (RMA paper default: 0.004).
-RMA_RESAMPLE_PROB: float = 0.004
+RMA_RESAMPLE_PROB: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,21 @@ class RmaEtSpec:
 
 
 DEFAULT_ET_SPEC = RmaEtSpec()
+
+
+def normalize_et(et, force_range=FORCE_COMPONENT_RANGE):
+    """Normalize e_t from raw Newtons to [-1, 1] using the component range.
+
+    This ensures the encoder sees bounded inputs regardless of force magnitude.
+    """
+    lo, hi = force_range
+    return 2.0 * (et - lo) / (hi - lo) - 1.0
+
+
+def denormalize_et(et_norm, force_range=FORCE_COMPONENT_RANGE):
+    """Inverse of normalize_et: [-1, 1] -> raw Newtons."""
+    lo, hi = force_range
+    return (et_norm + 1.0) * (hi - lo) / 2.0 + lo
 
 # Body links where forces are applied
 RMA_FORCE_BODY_NAMES: tuple[str, ...] = (

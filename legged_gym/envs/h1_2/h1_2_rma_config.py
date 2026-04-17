@@ -139,8 +139,8 @@ class H1_2RmaRoughCfg(LeggedRobotCfg):
 
     class rma:
         """RMA force randomization parameters (used by env)."""
-        resample_prob = 0.004
-        force_magnitude_range = [0.0, 10.0]
+        resample_prob = 0.01
+        force_magnitude_range = [0.0, 100.0]
 
 
 class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
@@ -163,7 +163,7 @@ class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
     class runner(LeggedRobotCfgPPO.runner):
         policy_class_name = "ActorCriticRecurrent"
         algorithm_class_name = 'PPO'
-        max_iterations = 10000
+        max_iterations = 20000
         run_name = ''
         experiment_name = 'h1_2_rma'
 
@@ -174,4 +174,12 @@ class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
         encoder_hidden_dims = [256, 128]
         decoder_hidden_dims = [256, 128]
         recon_coef = 0.5    # Reconstruction loss coefficient
-        encoder_lr = 1e-3   # Separate LR for encoder/decoder
+        encoder_lr = 1e-3   # Decoder-only reconstruction LR
+        # Encoder RL learning rate = PPO base LR * this scale.
+        # Smaller value prevents z_t from shifting too fast between
+        # PPO mini-batches (which destabilises the trust region).
+        encoder_rl_lr_scale = 0.1
+        # Force curriculum: linearly ramp force magnitude from 0 to
+        # max_force over this many iterations.  0 = no curriculum.
+        curriculum_steps = 10000
+        max_force = 100.0

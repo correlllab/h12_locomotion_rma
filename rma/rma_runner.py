@@ -1,10 +1,17 @@
-"""RMA Phase 1 on-policy runner.
+"""RMA Phase 1 on-policy runner — end-to-end encoder training.
 
-Extends OnPolicyRunner to:
-- Create encoder (e_t -> z_t) and decoder (z_t -> e_t_recon)
-- Augment actor/critic obs with z_t (8 dims) during collection
-- Train encoder/decoder with MSE reconstruction loss (separate optimizer)
-- Save/load encoder/decoder alongside actor-critic checkpoints
+Key design:
+  PPO stores [base_obs | e_t_norm] (47+9=56 actor, 50+9=59 critic).
+  An RmaActorCriticWrapper sits between PPO and the real ActorCriticRecurrent.
+  On every forward call the wrapper encodes e_t → z_t and forwards
+  [base_obs | z_t] to the inner network.  During PPO mini-batch updates the
+  encoder is live in the computation graph, so RL gradients (surrogate +
+  value loss) flow through it — the encoder learns to produce z_t values
+  that are *useful for control*, not merely reconstructable.
+
+  A separate decoder is still trained with MSE reconstruction loss as a
+  diagnostic / regulariser, but does NOT back-prop into the encoder (decoder
+  only).
 """
 
 import os
@@ -22,10 +29,12 @@ from rsl_rl.env import VecEnv
 
 from rma.env_factor_encoder import EnvFactorEncoder, EnvFactorEncoderCfg
 from rma.env_factor_decoder import EnvFactorDecoder, EnvFactorDecoderCfg
+from rma.env_factor_spec import normalize_et
+from rma.rma_actor_critic_wrapper import RmaActorCriticWrapper
 
 
 class RmaOnPolicyRunner:
-    """On-policy runner with RMA Phase 1 (encoder/decoder + reconstruction loss)."""
+    """On-policy runner with RMA Phase 1 (end-to-end encoder via wrapper)."""
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device='cpu'):
         self.cfg = train_cfg["runner"]
@@ -40,53 +49,95 @@ class RmaOnPolicyRunner:
         self.rma_et_dim = self.rma_cfg.get("et_dim", 9)
         self.rma_recon_coef = self.rma_cfg.get("recon_coef", 0.5)
 
-        # ---- Augmented obs dimensions ----
-        num_actor_obs = self.env.num_obs + self.rma_latent_dim   # 47 + 8 = 55
+        # ---- Inner actor-critic dimensions (what the LSTM actually sees) ----
+        num_inner_actor_obs = self.env.num_obs + self.rma_latent_dim   # 47 + 8 = 55
         if self.env.num_privileged_obs is not None:
-            num_critic_obs = self.env.num_privileged_obs + self.rma_latent_dim  # 50 + 8 = 58
+            num_inner_critic_obs = self.env.num_privileged_obs + self.rma_latent_dim  # 50 + 8 = 58
         else:
-            num_critic_obs = num_actor_obs
-        self._num_actor_obs = num_actor_obs
-        self._num_critic_obs = num_critic_obs
+            num_inner_critic_obs = num_inner_actor_obs
 
-        # ---- Create actor-critic with augmented obs ----
+        # ---- Storage dimensions (what PPO stores: base_obs + e_t_norm) ----
+        num_storage_actor_obs = self.env.num_obs + self.rma_et_dim    # 47 + 9 = 56
+        if self.env.num_privileged_obs is not None:
+            num_storage_critic_obs = self.env.num_privileged_obs + self.rma_et_dim  # 50 + 9 = 59
+        else:
+            num_storage_critic_obs = num_storage_actor_obs
+
+        # ---- Create inner actor-critic (receives [base_obs | z_t]) ----
         actor_critic_class = eval(self.cfg["policy_class_name"])
-        actor_critic: ActorCritic = actor_critic_class(
-            num_actor_obs, num_critic_obs,
+        inner_actor_critic: ActorCritic = actor_critic_class(
+            num_inner_actor_obs, num_inner_critic_obs,
             self.env.num_actions,
             **self.policy_cfg,
         ).to(self.device)
 
-        # ---- Create encoder/decoder ----
+        # ---- Create encoder ----
         self.encoder = EnvFactorEncoder(EnvFactorEncoderCfg(
             in_dim=self.rma_et_dim,
             latent_dim=self.rma_latent_dim,
             hidden_dims=tuple(self.rma_cfg.get("encoder_hidden_dims", [256, 128])),
         )).to(self.device)
 
+        # ---- Create wrapper (encoder + actor-critic, end-to-end) ----
+        #   PPO sees the wrapper as its actor_critic.  The wrapper's
+        #   parameters() includes both the inner actor-critic AND the encoder,
+        #   so PPO's Adam optimizer trains both with RL gradients.
+        wrapper = RmaActorCriticWrapper(
+            actor_critic=inner_actor_critic,
+            encoder=self.encoder,
+            num_base_actor_obs=self.env.num_obs,
+            num_base_critic_obs=(self.env.num_privileged_obs
+                                if self.env.num_privileged_obs is not None
+                                else self.env.num_obs),
+            et_dim=self.rma_et_dim,
+        ).to(self.device)
+
+        # ---- Create decoder (reconstruction diagnostic, trained separately) ----
         self.decoder = EnvFactorDecoder(EnvFactorDecoderCfg(
             in_dim=self.rma_latent_dim,
             out_dim=self.rma_et_dim,
             hidden_dims=tuple(self.rma_cfg.get("decoder_hidden_dims", [256, 128])),
-            use_output_scaling=True,
+            use_output_scaling=False,
         )).to(self.device)
 
-        # ---- Create PPO (standard, no RMA changes needed) ----
+        # ---- Create PPO with the *wrapper* as actor_critic ----
         alg_class = eval(self.cfg["algorithm_class_name"])
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        self.alg: PPO = alg_class(wrapper, device=self.device, **self.alg_cfg)
 
-        # ---- RMA optimizer (separate from PPO) ----
+        # ---- Replace PPO optimizer with param-group version ----
+        #   Encoder gets a smaller RL learning rate to prevent z_t from
+        #   shifting too fast between PPO mini-batches (which would violate
+        #   the trust region and destabilise training).
+        enc_lr_scale = self.rma_cfg.get("encoder_rl_lr_scale", 0.1)
+        base_lr = self.alg.learning_rate
+        encoder_param_ids = set(id(p) for p in self.encoder.parameters())
+        ac_params = [p for p in wrapper.parameters()
+                     if id(p) not in encoder_param_ids]
+        self.alg.optimizer = torch.optim.Adam([
+            {"params": ac_params, "lr": base_lr},
+            {"params": list(self.encoder.parameters()),
+             "lr": base_lr * enc_lr_scale},
+        ])
+
+        # ---- Decoder-only optimizer (reconstruction loss, no encoder) ----
         self.rma_optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) + list(self.decoder.parameters()),
+            self.decoder.parameters(),
             lr=self.rma_cfg.get("encoder_lr", 1e-3),
         )
 
-        # ---- Init storage with augmented obs shapes ----
+        # ---- Force curriculum ----
+        self._curriculum_steps = self.rma_cfg.get("curriculum_steps", 0)
+        self._max_force = self.rma_cfg.get("max_force",
+                                           self.env._rma_force_range[1]
+                                           if hasattr(self.env, '_rma_force_range')
+                                           else 100.0)
+
+        # ---- Init storage with *storage* obs shapes (base + e_t_norm) ----
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.alg.init_storage(
             self.env.num_envs, self.num_steps_per_env,
-            [num_actor_obs], [num_critic_obs],
+            [num_storage_actor_obs], [num_storage_critic_obs],
             [self.env.num_actions],
         )
 
@@ -105,6 +156,30 @@ class RmaOnPolicyRunner:
 
         _, _ = self.env.reset()
 
+    # -------------------------------------------------------------- #
+    #  Convenience: unwrap inner actor-critic
+    # -------------------------------------------------------------- #
+    @property
+    def _inner_actor_critic(self):
+        """The real ActorCriticRecurrent inside the wrapper."""
+        return self.alg.actor_critic.actor_critic
+
+    # -------------------------------------------------------------- #
+    #  Force curriculum
+    # -------------------------------------------------------------- #
+    def _update_force_curriculum(self, iteration: int) -> float:
+        """Linearly ramp force magnitude from 0 to max over curriculum_steps.
+
+        Returns the current max force for logging.
+        """
+        if self._curriculum_steps <= 0 or not hasattr(self.env, '_rma_force_range'):
+            return self._max_force
+
+        progress = min(1.0, iteration / self._curriculum_steps)
+        current_max = self._max_force * progress
+        self.env._rma_force_range = (0.0, current_max)
+        return current_max
+
     # ------------------------------------------------------------------ #
     #  Training loop
     # ------------------------------------------------------------------ #
@@ -120,8 +195,7 @@ class RmaOnPolicyRunner:
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
-        self.alg.actor_critic.train()
-        self.encoder.train()
+        self.alg.actor_critic.train()   # wrapper (includes encoder + inner AC)
         self.decoder.train()
 
         ep_infos = []
@@ -134,21 +208,26 @@ class RmaOnPolicyRunner:
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
 
+            # ---- Force curriculum: ramp force range over training ----
+            current_max_force = self._update_force_curriculum(it)
+
             # ---- Rollout collection ----
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    # Get e_t from env and encode to z_t
-                    e_t = self.env.rma_et  # (num_envs, 9)
-                    z_t = self.encoder(e_t)  # (num_envs, 8)
+                    # Get e_t from env and normalize to [-1, 1]
+                    e_t_raw = self.env.rma_et                  # (N, 9)
+                    e_t_norm = normalize_et(e_t_raw)           # (N, 9)
 
-                    # Augment observations with z_t
-                    augmented_obs = torch.cat([obs, z_t], dim=-1)         # (N, 55)
-                    augmented_critic = torch.cat([critic_obs, z_t], dim=-1)  # (N, 58)
+                    # Store [base_obs | e_t_norm] — the wrapper will encode
+                    # e_t → z_t during its forward pass (both here in
+                    # inference_mode and later during PPO update with grads).
+                    augmented_obs = torch.cat([obs, e_t_norm], dim=-1)           # (N, 56)
+                    augmented_critic = torch.cat([critic_obs, e_t_norm], dim=-1) # (N, 59)
 
-                    # Store e_t for reconstruction loss
-                    self.rma_et_buffer[i] = e_t
+                    # Store e_t for decoder reconstruction loss
+                    self.rma_et_buffer[i] = e_t_norm
 
-                    # PPO act
+                    # PPO act (wrapper encodes e_t → z_t internally)
                     actions = self.alg.act(augmented_obs, augmented_critic)
 
                     # Env step
@@ -174,17 +253,26 @@ class RmaOnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
 
-                # Compute returns (need augmented critic obs for last step)
+                # Compute returns (wrapper encodes e_t internally)
                 start = stop
-                e_t = self.env.rma_et
-                z_t = self.encoder(e_t)
-                last_augmented_critic = torch.cat([critic_obs, z_t], dim=-1)
+                e_t_raw = self.env.rma_et
+                e_t_norm = normalize_et(e_t_raw)
+                last_augmented_critic = torch.cat([critic_obs, e_t_norm], dim=-1)
                 self.alg.compute_returns(last_augmented_critic)
 
-            # ---- PPO update ----
+            # ---- PPO update (RL gradients flow through wrapper → encoder) ----
             mean_value_loss, mean_surrogate_loss = self.alg.update()
 
-            # ---- RMA reconstruction update ----
+            # Restore encoder LR ratio — PPO's adaptive KL schedule sets
+            # all param groups to the same LR, overriding our scaling.
+            # Param group 1 is the encoder (see __init__).
+            if len(self.alg.optimizer.param_groups) > 1:
+                enc_lr_scale = self.rma_cfg.get("encoder_rl_lr_scale", 0.1)
+                self.alg.optimizer.param_groups[1]['lr'] = (
+                    self.alg.learning_rate * enc_lr_scale
+                )
+
+            # ---- Decoder reconstruction update (decoder only) ----
             mean_recon_loss = self._rma_update()
 
             stop = time.time()
@@ -203,14 +291,20 @@ class RmaOnPolicyRunner:
         ))
 
     # ------------------------------------------------------------------ #
-    #  RMA reconstruction update
+    #  Decoder reconstruction update (decoder only, encoder gets RL grads)
     # ------------------------------------------------------------------ #
     def _rma_update(self) -> float:
-        """Train encoder+decoder with MSE reconstruction loss on full e_t buffer."""
+        """Train decoder with MSE reconstruction loss.
+
+        The encoder is in the forward graph (z = encoder(et)), but
+        rma_optimizer only manages decoder parameters, so only the decoder
+        is updated here.  We explicitly zero stale encoder gradients
+        afterward to keep things clean for the next PPO update cycle.
+        """
         # Flatten: (T, N, 9) -> (T*N, 9)
         et_flat = self.rma_et_buffer.flatten(0, 1)
 
-        # Forward
+        # Forward — encoder is in graph but only decoder is optimised
         z = self.encoder(et_flat)
         recon_loss = self.decoder.compute_reconstruction_loss(z, et_flat)
         loss = self.rma_recon_coef * recon_loss
@@ -218,11 +312,12 @@ class RmaOnPolicyRunner:
         # Backward
         self.rma_optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            max_norm=1.0,
-        )
+        nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
         self.rma_optimizer.step()
+
+        # Zero stale encoder grads from recon loss (PPO optimizer manages
+        # encoder grads; we don't want leftover recon grads leaking in).
+        self.encoder.zero_grad()
 
         return recon_loss.item()
 
@@ -259,6 +354,7 @@ class RmaOnPolicyRunner:
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        self.writer.add_scalar('RMA/max_force_curriculum', locs['current_max_force'], locs['it'])
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
@@ -302,8 +398,13 @@ class RmaOnPolicyRunner:
     #  Save / Load
     # ------------------------------------------------------------------ #
     def save(self, path, infos=None):
+        """Save checkpoint.
+
+        Stores inner actor-critic and encoder state dicts separately
+        (same format as before) so deployment scripts work unchanged.
+        """
         torch.save({
-            'model_state_dict': self.alg.actor_critic.state_dict(),
+            'model_state_dict': self._inner_actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'encoder_state_dict': self.encoder.state_dict(),
             'decoder_state_dict': self.decoder.state_dict(),
@@ -314,7 +415,7 @@ class RmaOnPolicyRunner:
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)
-        self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        self._inner_actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if 'encoder_state_dict' in loaded_dict:
             self.encoder.load_state_dict(loaded_dict['encoder_state_dict'])
         if 'decoder_state_dict' in loaded_dict:
@@ -327,9 +428,23 @@ class RmaOnPolicyRunner:
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):
-        self.alg.actor_critic.eval()
-        self.encoder.eval()
+        """Return inference function compatible with play.py.
+
+        Returns a closure that automatically fetches e_t from the env,
+        normalises it, concatenates with base obs, and runs the wrapper's
+        act_inference (which encodes e_t → z_t internally).  This way
+        callers (like play.py) can pass plain 47-dim obs and it just works.
+        """
+        self.alg.actor_critic.eval()  # wrapper (encoder + inner AC)
         if device is not None:
             self.alg.actor_critic.to(device)
-            self.encoder.to(device)
-        return self.alg.actor_critic.act_inference
+
+        wrapper = self.alg.actor_critic
+        env = self.env
+
+        def _inference(obs):
+            e_t_norm = normalize_et(env.rma_et).to(obs.device)
+            augmented = torch.cat([obs, e_t_norm], dim=-1)
+            return wrapper.act_inference(augmented)
+
+        return _inference

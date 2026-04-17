@@ -4,7 +4,7 @@ Phase 1 (training, sim):
   - Sample forces: sample_rma_forces() for torso + both wrists.
   - Build e_t: build_et(torso, left, right) -> 9-dim force vector.
   - Apply forces: make_rma_force_tensor() -> gym.apply_rigid_body_force_tensors().
-  - Resample with prob RMA_RESAMPLE_PROB (0.004) via resample_rma_forces_for_envs().
+  - Resample with prob RMA_RESAMPLE_PROB (0.01) via resample_rma_forces_for_envs().
   - Encoder: e_t (9) -> z_t (8); policy(obs, z_t). Decoder for reconstruction loss.
 
 Phase 2 (deploy):
@@ -14,6 +14,7 @@ Phase 2 (deploy):
 from .env_factor_encoder import EnvFactorEncoder, EnvFactorEncoderCfg
 from .env_factor_decoder import EnvFactorDecoder, EnvFactorDecoderCfg
 from .adaptation_module import Adaptation1DCNN, Adaptation1DCNNCfg
+from .rma_actor_critic_wrapper import RmaActorCriticWrapper
 from .env_factor_spec import (
     DEFAULT_ET_SPEC,
     FORCE_COMPONENT_RANGE,
@@ -21,6 +22,8 @@ from .env_factor_spec import (
     RMA_FORCE_BODY_NAMES,
     RMA_RESAMPLE_PROB,
     RmaEtSpec,
+    normalize_et,
+    denormalize_et,
 )
 from .gym_et_builder import (
     build_et,
@@ -34,6 +37,7 @@ __all__ = [
     "EnvFactorEncoderCfg",
     "EnvFactorDecoder",
     "EnvFactorDecoderCfg",
+    "RmaActorCriticWrapper",
     "Adaptation1DCNN",
     "Adaptation1DCNNCfg",
     "RmaEtSpec",
@@ -42,6 +46,8 @@ __all__ = [
     "FORCE_MAGNITUDE_RANGE",
     "FORCE_COMPONENT_RANGE",
     "RMA_RESAMPLE_PROB",
+    "normalize_et",
+    "denormalize_et",
     "build_et",
     "sample_rma_forces",
     "resample_rma_forces_for_envs",

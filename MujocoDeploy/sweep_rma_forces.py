@@ -32,6 +32,12 @@ from rsl_rl.modules import ActorCriticRecurrent
 from rma.env_factor_encoder import EnvFactorEncoder, EnvFactorEncoderCfg
 
 
+def normalize_et_np(et_np, force_range=(-100.0, 100.0)):
+    """Normalize raw force (N) to [-1, 1] (numpy version)."""
+    lo, hi = force_range
+    return 2.0 * (et_np - lo) / (hi - lo) - 1.0
+
+
 # ──────────────────────────────────────────────────────────────
 #  Data structures
 # ──────────────────────────────────────────────────────────────
@@ -246,15 +252,16 @@ def run_trial(m_template, policy, encoder, cfg, trial: TrialSpec) -> TrialResult
             phase = (t / phase_period) % 1.0
             obs_47, proj_grav = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
-            # Encode
+            # Encode (normalize to [-1,1] before encoder)
             if trial.use_encoder and t >= force_start:
                 e_t = np.concatenate([trial.torso_force, trial.left_wrist_force,
                                       trial.right_wrist_force]).astype(np.float32)
             else:
                 e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
 
+            e_t_norm = normalize_et_np(e_t)
             with torch.no_grad():
-                z_t = encoder(torch.from_numpy(e_t).unsqueeze(0).float()).numpy().squeeze()
+                z_t = encoder(torch.from_numpy(e_t_norm).unsqueeze(0).float()).numpy().squeeze()
 
             actor_obs = np.concatenate([obs_47, z_t]).astype(np.float32)
             with torch.no_grad():

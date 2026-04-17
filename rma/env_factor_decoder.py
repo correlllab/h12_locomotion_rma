@@ -38,8 +38,8 @@ class EnvFactorDecoderCfg:
     out_dim: int = 9    # torso(3) + left_wrist(3) + right_wrist(3)
     hidden_dims: tuple[int, ...] = (256, 128)
     activation: str = "elu"
-    use_output_scaling: bool = True
-    force_component_range: tuple[float, float] = (-10.0, 10.0)
+    use_output_scaling: bool = False   # Disabled: encoder/decoder work in normalized [-1,1] space
+    force_component_range: tuple[float, float] = (-100.0, 100.0)
 
 
 class EnvFactorDecoder(nn.Module):

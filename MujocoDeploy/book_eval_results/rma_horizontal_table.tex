@@ -1,0 +1,26 @@
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.15}
+\caption{RMA vs.\ Baseline under horizontal torso force perturbation in MuJoCo. Each magnitude is tested over 9 horizontal directions (4 axis-aligned + 5 random). Vertical ($\pm Z$) directions excluded as they trivially assist/load the robot. Metrics are averaged over surviving trials.}
+\label{tab:rma_horizontal}
+\begin{tabularx}{\textwidth}{r|cc|cc|cc|cc}
+\toprule
+\multirow{2}{*}{\textbf{Force (N)}} & \multicolumn{2}{c|}{\textbf{Success (\%)}} & \multicolumn{2}{c|}{\textbf{RMSE (m/s)}} & \multicolumn{2}{c|}{\textbf{Orient. Err.}} & \multicolumn{2}{c}{\textbf{Energy (W)}} \\
+& RMA & Base & RMA & Base & RMA & Base & RMA & Base \\
+\midrule
+0 & 100.0 & 100.0 & 0.139 & 0.139 & 0.054 & 0.054 & 125.4 & 125.4 \\
+5 & 100.0 & 100.0 & \textbf{0.121} & 0.137 & 0.057 & \textbf{0.055} & 126.4 & \textbf{126.4} \\
+10 & 100.0 & 100.0 & \textbf{0.117} & 0.142 & 0.063 & \textbf{0.057} & 132.5 & \textbf{127.4} \\
+15 & 100.0 & 100.0 & \textbf{0.135} & 0.148 & 0.068 & \textbf{0.061} & 133.8 & \textbf{127.6} \\
+20 & 100.0 & 100.0 & 0.160 & \textbf{0.144} & 0.076 & \textbf{0.067} & 142.8 & \textbf{131.8} \\
+30 & 100.0 & 100.0 & \textbf{0.218} & 0.221 & 0.082 & \textbf{0.073} & 145.8 & \textbf{129.2} \\
+40 & 100.0 & 100.0 & 0.315 & \textbf{0.288} & 0.096 & \textbf{0.086} & 163.2 & \textbf{143.0} \\
+50 & 100.0 & 100.0 & 0.401 & \textbf{0.342} & 0.112 & \textbf{0.096} & 253.1 & \textbf{189.1} \\
+60 & 88.9 & \textbf{100.0} & 0.450 & \textbf{0.431} & 0.116 & \textbf{0.114} & 247.5 & \textbf{230.6} \\
+75 & 66.7 & \textbf{77.8} & 0.831 & \textbf{0.752} & 0.132 & \textbf{0.120} & 496.8 & \textbf{493.6} \\
+100 & \textbf{22.2} & 0.0 & 1.123 & --- & 0.118 & --- & 714.6 & --- \\
+125 & 22.2 & 22.2 & 0.453 & \textbf{0.389} & 0.089 & \textbf{0.081} & 264.5 & \textbf{184.1} \\
+150 & 22.2 & 22.2 & 0.687 & \textbf{0.422} & 0.127 & \textbf{0.093} & 477.6 & \textbf{197.8} \\
+\bottomrule
+\end{tabularx}
+\end{table}

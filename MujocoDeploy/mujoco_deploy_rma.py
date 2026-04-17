@@ -42,6 +42,13 @@ import mujoco.viewer
 
 from rsl_rl.modules import ActorCriticRecurrent
 from rma.env_factor_encoder import EnvFactorEncoder, EnvFactorEncoderCfg
+from rma.env_factor_spec import normalize_et as _normalize_et_torch
+
+
+def normalize_et_np(et_np, force_range=(-100.0, 100.0)):
+    """Normalize raw force (N) to [-1, 1] (numpy version)."""
+    lo, hi = force_range
+    return 2.0 * (et_np - lo) / (hi - lo) - 1.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -359,7 +366,7 @@ def main():
             phase = (t / phase_period) % 1.0
             obs_47 = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
-            # Encode forces -> z_t
+            # Encode forces -> z_t (normalize to [-1,1] before encoder)
             if use_encoder and t >= force_start:
                 e_t = np.concatenate([
                     cfg["torso_force"],
@@ -369,8 +376,9 @@ def main():
             else:
                 e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
 
+            e_t_norm = normalize_et_np(e_t)
             with torch.no_grad():
-                e_t_tensor = torch.from_numpy(e_t).unsqueeze(0).float()
+                e_t_tensor = torch.from_numpy(e_t_norm).unsqueeze(0).float()
                 z_t = encoder(e_t_tensor).numpy().squeeze()  # (8,)
 
             # Concatenate obs + z_t -> 55

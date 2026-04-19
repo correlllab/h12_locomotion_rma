@@ -160,3 +160,6 @@ cython_debug/
 
 # logs
 logs
+
+# Generated video recordings (regeneratable from MujocoDeploy/record_rma_videos.py)
+MujocoDeploy/videos/

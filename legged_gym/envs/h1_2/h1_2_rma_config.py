@@ -95,10 +95,15 @@ class H1_2RmaRoughCfg(LeggedRobotCfg):
         dt = 0.0025
 
     class domain_rand(LeggedRobotCfg.domain_rand):
-        randomize_friction = True
-        friction_range = [0.1, 1.25]
-        randomize_base_mass = True
-        added_mass_range = [-1., 3.]
+        # Paper-full branch: friction, base mass, and COM are randomized via
+        # the RMA callbacks in h1_2_rma_env.py (`_process_rigid_shape_props`
+        # and `_process_rigid_body_props`), which override the legged_gym
+        # defaults to sync the physics with e_t. Disable the base-class
+        # randomizers so they don't double-randomize on top.
+        randomize_friction = False
+        friction_range = [0.1, 2.0]    # IsaacGym/PhysX humanoid range; consumed by env callback
+        randomize_base_mass = False
+        added_mass_range = [0., 6.]    # paper Table I; consumed by env callback
         push_robots = True
         push_interval_s = 5
         max_push_vel_xy = 1.5
@@ -138,9 +143,24 @@ class H1_2RmaRoughCfg(LeggedRobotCfg):
             contact = 0.18
 
     class rma:
-        """RMA force randomization parameters (used by env)."""
+        """RMA paper-full randomization ranges (consumed by env).
+
+        See Kumar et al. 2021 Table I. Ranges adapted for H1-2 humanoid:
+          - force_magnitude_range: extension beyond paper (our sweep)
+          - base_mass_range: payload in kg
+          - com_offset_range: base-link COM shift (m)
+          - motor_strength_range: per-joint torque scale
+          - friction_range: ground friction μ — narrowed from paper's
+            [0.05, 4.5] (RaiSim/A1) to [0.1, 2.0] for IsaacGym/PhysX
+            humanoid; above ~2.0 the foot is effectively glued and the
+            adaptation signal saturates.
+        """
         resample_prob = 0.01
         force_magnitude_range = [0.0, 100.0]
+        base_mass_range = [0.0, 6.0]
+        com_offset_range = [-0.05, 0.05]
+        motor_strength_range = [0.90, 1.10]
+        friction_range = [0.1, 2.0]
 
 
 class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
@@ -169,7 +189,8 @@ class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
 
     class rma:
         """RMA encoder/decoder architecture and training params."""
-        et_dim = 9          # e_t: torso(3) + left_wrist(3) + right_wrist(3)
+        # paper-full e_t: forces(9) + mass(1) + com(3) + motor_strength(12) + friction(1)
+        et_dim = 26
         latent_dim = 8      # z_t dimension
         encoder_hidden_dims = [256, 128]
         decoder_hidden_dims = [256, 128]

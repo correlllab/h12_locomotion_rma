@@ -24,7 +24,14 @@ from rma.gym_et_builder import (
     build_et,
     make_rma_force_tensor,
 )
-from rma.env_factor_spec import RMA_RESAMPLE_PROB
+from rma.env_factor_spec import (
+    RMA_RESAMPLE_PROB,
+    DEFAULT_ET_SPEC,
+    BASE_MASS_RANGE,
+    COM_OFFSET_RANGE,
+    MOTOR_STRENGTH_RANGE,
+    FRICTION_RANGE,
+)
 
 
 class H1_2RmaRobot(LeggedRobot):
@@ -142,7 +149,7 @@ class H1_2RmaRobot(LeggedRobot):
         self.feet_vel = self.feet_state[:, :, 7:10]
 
     def _init_rma_buffers(self):
-        """Initialize RMA force buffers and find body indices for force application."""
+        """Initialize RMA force + paper-full factor buffers and body indices."""
         # Find body indices for force application
         self._rma_torso_body_idx = self.gym.find_actor_rigid_body_handle(
             self.envs[0], self.actor_handles[0], "torso_link"
@@ -159,20 +166,56 @@ class H1_2RmaRobot(LeggedRobot):
         self.rma_left_force = torch.zeros(self.num_envs, 3, device=self.device)
         self.rma_right_force = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # e_t buffer (filled each step in compute_observations)
-        self.rma_et = torch.zeros(self.num_envs, 9, device=self.device)
+        # Paper-full static factor buffers (sampled per env at reset, held
+        # constant through the episode — consistent with Kumar et al. 2021).
+        self.rma_base_mass_offset = torch.zeros(self.num_envs, 1, device=self.device)
+        self.rma_com_offset = torch.zeros(self.num_envs, 3, device=self.device)
+        # Motor strength: 12-d per-joint scale applied to leg torques.
+        self.rma_motor_strength = torch.ones(
+            self.num_envs, self.num_actions, device=self.device
+        )
+        self.rma_friction = torch.zeros(self.num_envs, 1, device=self.device)
 
-        # Resample probability
+        # e_t buffer: 26 dims in paper-full layout
+        self._et_spec = DEFAULT_ET_SPEC
+        self.rma_et = torch.zeros(self.num_envs, self._et_spec.dim, device=self.device)
+
+        # Resample probability (forces only)
         self._rma_resample_prob = getattr(self.cfg.rma, 'resample_prob', RMA_RESAMPLE_PROB)
 
-        # Force magnitude range from config
-        self._rma_force_range = tuple(getattr(self.cfg.rma, 'force_magnitude_range', [0.0, 10.0]))
+        # Ranges from config (with paper-default fallbacks)
+        self._rma_force_range = tuple(getattr(self.cfg.rma, 'force_magnitude_range', [0.0, 100.0]))
+        self._rma_base_mass_range = tuple(getattr(self.cfg.rma, 'base_mass_range', BASE_MASS_RANGE))
+        self._rma_com_offset_range = tuple(getattr(self.cfg.rma, 'com_offset_range', COM_OFFSET_RANGE))
+        self._rma_motor_strength_range = tuple(getattr(self.cfg.rma, 'motor_strength_range', MOTOR_STRENGTH_RANGE))
+        self._rma_friction_range = tuple(getattr(self.cfg.rma, 'friction_range', FRICTION_RANGE))
 
         # Sample initial forces
         t, l, r = sample_rma_forces(self.num_envs, self.device, self._rma_force_range)
         self.rma_torso_force[:] = t
         self.rma_left_force[:] = l
         self.rma_right_force[:] = r
+
+        # Seed static factor buffers from host-side samples that
+        # `_process_rigid_{shape,body}_props` used for physical randomization.
+        # Motor strength has no physics-side counterpart (it's applied in
+        # `_compute_torques`), so we sample it directly here.
+        if hasattr(self, "_rma_friction_host"):
+            self.rma_friction[:, 0] = torch.from_numpy(
+                self._rma_friction_host.astype("float32")
+            ).to(self.device)
+        if hasattr(self, "_rma_base_mass_host"):
+            self.rma_base_mass_offset[:, 0] = torch.from_numpy(
+                self._rma_base_mass_host.astype("float32")
+            ).to(self.device)
+            self.rma_com_offset[:] = torch.from_numpy(
+                self._rma_com_offset_host.astype("float32")
+            ).to(self.device)
+        ms_lo, ms_hi = self._rma_motor_strength_range
+        self.rma_motor_strength[:] = (
+            torch.rand(self.num_envs, self.num_actions, device=self.device)
+            * (ms_hi - ms_lo) + ms_lo
+        )
 
     # ------------------------------------------------------------------ #
     #  Step
@@ -235,13 +278,13 @@ class H1_2RmaRobot(LeggedRobot):
     #  Torques: 12 policy actions -> 27 DOF torques
     # ------------------------------------------------------------------ #
     def _compute_torques(self, actions):
-        """Compute PD torques for all 27 DOFs.
+        """Compute PD torques for all 27 DOFs, scaling leg torques by the
+        per-joint motor_strength factor (paper-full randomization).
 
-        Leg DOFs (0-11): target = action * scale + default
-        Upper body DOFs (12-26): target = default (PD holding)
+        Leg DOFs (0-11): target = action * scale + default; torque scaled.
+        Upper body DOFs (12-26): target = default (PD holding); unscaled.
         """
         actions_scaled = actions * self.cfg.control.action_scale  # (N, 12)
-        # Pad to full DOF space: upper body gets zero action offset
         full_actions_scaled = torch.zeros(
             self.num_envs, self.num_dof, device=self.device
         )
@@ -249,6 +292,10 @@ class H1_2RmaRobot(LeggedRobot):
         torques = (
             self.p_gains * (full_actions_scaled + self.default_dof_pos - self.dof_pos)
             - self.d_gains * self.dof_vel
+        )
+        # Per-joint motor-strength scale on leg torques only
+        torques[:, :self.num_actions] = (
+            torques[:, :self.num_actions] * self.rma_motor_strength
         )
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
@@ -307,8 +354,15 @@ class H1_2RmaRobot(LeggedRobot):
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
 
-        # Build e_t (forces only, 9 dims) for the runner
-        self.rma_et = build_et(self.rma_torso_force, self.rma_left_force, self.rma_right_force)
+        # Build e_t (paper-full, 26 dims) for the runner
+        self.rma_et = build_et(
+            self.rma_torso_force, self.rma_left_force, self.rma_right_force,
+            base_mass_offset=self.rma_base_mass_offset,
+            com_offset=self.rma_com_offset,
+            motor_strength=self.rma_motor_strength,
+            friction=self.rma_friction,
+            spec=self._et_spec,
+        )
 
     # ------------------------------------------------------------------ #
     #  Post-physics + callbacks
@@ -332,13 +386,60 @@ class H1_2RmaRobot(LeggedRobot):
         return super()._post_physics_step_callback()
 
     def reset_idx(self, env_ids):
-        """Reset environments and resample forces."""
+        """Reset environments; resample only the time-varying factors.
+
+        Friction, mass, COM are baked into Isaac Gym actors at env creation,
+        so they stay fixed across resets (one sample per env — classic
+        domain randomization). Motor strength is purely software-side and
+        COULD be resampled, but we also hold it constant per env so every
+        random draw the encoder sees corresponds to a real, consistent
+        physics instance. Only external forces change step-to-step.
+        """
         super().reset_idx(env_ids)
         if len(env_ids) > 0:
             resample_rma_forces_for_envs(
                 self.rma_torso_force, self.rma_left_force, self.rma_right_force, env_ids,
                 self._rma_force_range,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Physical-property randomization (paper-full)
+    # ------------------------------------------------------------------ #
+    # These callbacks are invoked by the base-class `_create_envs` BEFORE
+    # `_init_buffers` runs, so we can't read `self.rma_friction` etc. yet.
+    # Instead we lazily build host-side numpy arrays of per-env samples the
+    # first time each callback fires, and `_init_rma_buffers` copies them
+    # to the GPU buffers consumed by the encoder.
+    def _process_rigid_shape_props(self, props, env_id):
+        if not hasattr(self, "_rma_friction_host"):
+            lo, hi = getattr(self.cfg.rma, "friction_range", FRICTION_RANGE)
+            self._rma_friction_host = np.random.uniform(lo, hi, size=self.num_envs)
+        f = float(self._rma_friction_host[env_id])
+        for s in range(len(props)):
+            props[s].friction = f
+        return props
+
+    def _process_rigid_body_props(self, props, env_id):
+        """Apply base-link mass offset and COM shift.
+
+        props[0] is the pelvis (base) link — we add sampled mass and
+        translate its COM. Per-env samples held on host arrays; GPU copies
+        happen in `_init_rma_buffers`.
+        """
+        if not hasattr(self, "_rma_base_mass_host"):
+            lo, hi = getattr(self.cfg.rma, "base_mass_range", BASE_MASS_RANGE)
+            self._rma_base_mass_host = np.random.uniform(lo, hi, size=self.num_envs)
+            lo_c, hi_c = getattr(self.cfg.rma, "com_offset_range", COM_OFFSET_RANGE)
+            self._rma_com_offset_host = np.random.uniform(lo_c, hi_c, size=(self.num_envs, 3))
+
+        m_offset = float(self._rma_base_mass_host[env_id])
+        props[0].mass = props[0].mass + m_offset
+
+        cx, cy, cz = (float(v) for v in self._rma_com_offset_host[env_id])
+        props[0].com.x = props[0].com.x + cx
+        props[0].com.y = props[0].com.y + cy
+        props[0].com.z = props[0].com.z + cz
+        return props
 
     # ------------------------------------------------------------------ #
     #  Reward functions (identical to unitree rl gym H1_2)

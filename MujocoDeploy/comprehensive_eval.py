@@ -209,14 +209,21 @@ def run_trial(
             phase = (t / phase_period) % 1.0
             obs_47, proj_grav = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
+            et_dim = int(cfg.get("rma_et_dim", 9))
             if use_encoder and t >= force_start:
-                e_t = np.concatenate([condition.torso_force,
-                                      condition.left_wrist_force,
-                                      condition.right_wrist_force]).astype(np.float32)
+                forces = np.concatenate([condition.torso_force,
+                                         condition.left_wrist_force,
+                                         condition.right_wrist_force]).astype(np.float32)
             else:
-                e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
-
-            e_t_norm = normalize_et_np(e_t)
+                forces = np.zeros(9, dtype=np.float32)
+            forces_norm = normalize_et_np(forces)
+            if et_dim > 9:
+                e_t_norm = np.concatenate([
+                    forces_norm,
+                    np.zeros(et_dim - 9, dtype=np.float32),
+                ])
+            else:
+                e_t_norm = forces_norm
             with torch.no_grad():
                 z_t = encoder(torch.from_numpy(e_t_norm).unsqueeze(0).float()).numpy().squeeze()
 

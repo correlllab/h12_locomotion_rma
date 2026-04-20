@@ -13,6 +13,7 @@ Example:
 
 import argparse
 import os
+import sys
 from datetime import datetime
 
 import isaacgym  # noqa: F401 must import before torch
@@ -25,32 +26,26 @@ from legged_gym.utils.helpers import get_load_path, class_to_dict
 from rma.phase2_runner import RmaPhase2Runner, Phase2Cfg
 
 
-def _add_phase2_args():
-    """Return argparse-compatible entries for gymutil's custom_parameters.
-
-    We reuse get_args() for consistency with train.py, but extend it with
-    Phase 2-specific options via monkeypatch on gymutil.
-    """
-    # Done inline in main() via env-var escape hatch — see below.
-
-
 def parse_phase2_args():
-    # We reuse get_args() so the user can pass the standard IsaacGym args
-    # (--task, --headless, --num_envs, --rl_device, ...), but add a few
-    # Phase 2 specific ones via a second parser that consumes the remaining.
-    args = get_args()
-    p = argparse.ArgumentParser()
+    # gymutil.parse_arguments() (called inside get_args()) is strict and rejects
+    # unknown CLI flags. So we pre-parse Phase 2-specific args, strip them from
+    # sys.argv, then call get_args() with only the IsaacGym args remaining.
+    p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--teacher_run", type=str, default=None,
-                   help="Phase 1 run directory (e.g. Apr19_12-40-02_paperfull_v1); "
+                   help="Phase 1 run directory (e.g. Apr19_14-17-35_paperfull_v1); "
                         "default = latest run in logs/<experiment>/")
     p.add_argument("--teacher_ckpt", type=int, default=-1,
                    help="Phase 1 checkpoint iteration (default: latest)")
-    p.add_argument("--phase2_iterations", type=int, default=5000,
-                   help="Number of Phase 2 training iterations")
+    p.add_argument("--phase2_iterations", type=int, default=1000,
+                   help="Number of Phase 2 training iterations (paper: 1000)")
     p.add_argument("--phase2_lr", type=float, default=5e-4)
-    p.add_argument("--phase2_hist_len", type=int, default=30)
+    p.add_argument("--phase2_hist_len", type=int, default=50)
     p.add_argument("--phase2_run_name", type=str, default="phase2")
-    phase2_args, _ = p.parse_known_args()
+    phase2_args, remaining = p.parse_known_args()
+
+    # Restore sys.argv with only the IsaacGym-known args before calling get_args
+    sys.argv = [sys.argv[0]] + remaining
+    args = get_args()
     for k, v in vars(phase2_args).items():
         setattr(args, k, v)
     return args

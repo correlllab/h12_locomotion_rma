@@ -157,8 +157,8 @@ def load_models(cfg, ckpt_path=None, device="cpu"):
         encoder = EnvFactorEncoder(EnvFactorEncoderCfg(**enc_data["cfg"]))
         encoder.load_state_dict(enc_data["encoder_state_dict"])
 
-    policy.eval()
-    encoder.eval()
+    policy.to(device).eval()
+    encoder.to(device).eval()
     return policy, encoder
 
 
@@ -166,7 +166,7 @@ def load_models(cfg, ckpt_path=None, device="cpu"):
 #  Single trial runner
 # ──────────────────────────────────────────────────────────────
 
-def run_trial(m_template, policy, encoder, cfg, trial: TrialSpec) -> TrialResult:
+def run_trial(m_template, policy, encoder, cfg, trial: TrialSpec, device: str = "cpu") -> TrialResult:
     """Run one headless MuJoCo trial, return metrics."""
     eval_cfg = cfg["eval"]
     dt = cfg["simulation_dt"]
@@ -252,22 +252,34 @@ def run_trial(m_template, policy, encoder, cfg, trial: TrialSpec) -> TrialResult
             phase = (t / phase_period) % 1.0
             obs_47, proj_grav = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
-            # Encode (normalize to [-1,1] before encoder)
+            # Encode (normalize to [-1,1] before encoder).
+            # Paper-full e_t is 26-dim: first 9 are force components, remaining
+            # 17 (mass/COM/motor_strength/friction) are held at their per-group
+            # midpoint → 0 in normalized space.
+            et_dim = int(cfg.get("rma_et_dim", 9))
             if trial.use_encoder and t >= force_start:
-                e_t = np.concatenate([trial.torso_force, trial.left_wrist_force,
-                                      trial.right_wrist_force]).astype(np.float32)
+                forces = np.concatenate([trial.torso_force, trial.left_wrist_force,
+                                         trial.right_wrist_force]).astype(np.float32)
             else:
-                e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
-
-            e_t_norm = normalize_et_np(e_t)
+                forces = np.zeros(9, dtype=np.float32)
+            forces_norm = normalize_et_np(forces)
+            if et_dim > 9:
+                e_t_norm = np.concatenate([
+                    forces_norm,
+                    np.zeros(et_dim - 9, dtype=np.float32),
+                ])
+            else:
+                e_t_norm = forces_norm
             with torch.no_grad():
-                z_t = encoder(torch.from_numpy(e_t_norm).unsqueeze(0).float()).numpy().squeeze()
+                z_t = encoder(
+                    torch.from_numpy(e_t_norm).unsqueeze(0).float().to(device)
+                ).cpu().numpy().squeeze()
 
             actor_obs = np.concatenate([obs_47, z_t]).astype(np.float32)
             with torch.no_grad():
                 action = policy.act_inference(
-                    torch.from_numpy(actor_obs).unsqueeze(0).float()
-                ).numpy().squeeze()
+                    torch.from_numpy(actor_obs).unsqueeze(0).float().to(device)
+                ).cpu().numpy().squeeze()
 
             # Collect tracking metrics (after warmup)
             if t >= tracking_warmup:
@@ -673,7 +685,15 @@ def main():
     parser.add_argument("--config", type=str, default=os.path.join(_SCRIPT_DIR, "sweep_config.yaml"))
     parser.add_argument("--ckpt", type=str, default=None, help="Direct checkpoint path")
     parser.add_argument("--plot_only", action="store_true", help="Re-plot from existing CSV")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Inference device: 'cuda', 'cpu', or 'auto' (default).")
     args = parser.parse_args()
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    print(f"Inference device: {device}")
 
     config_path = args.config if os.path.isabs(args.config) else os.path.join(_SCRIPT_DIR, args.config)
     with open(config_path, "r") as f:
@@ -708,7 +728,7 @@ def main():
         if not os.path.isabs(ckpt_path):
             ckpt_path = os.path.normpath(os.path.join(config_dir, ckpt_path))
 
-    policy, encoder = load_models(cfg, ckpt_path)
+    policy, encoder = load_models(cfg, ckpt_path, device=device)
 
     # Load MuJoCo model
     m = mujoco.MjModel.from_xml_path(cfg["xml_path"])
@@ -742,7 +762,7 @@ def main():
     results = []
     t_start = time.time()
     for i, trial in enumerate(trials):
-        r = run_trial(m, policy, encoder, cfg, trial)
+        r = run_trial(m, policy, encoder, cfg, trial, device=device)
         results.append(r)
         status = "OK" if r.success else f"FALL@{r.survival_time:.1f}s"
         enc_tag = "RMA" if r.use_encoder else "NO_ENC"

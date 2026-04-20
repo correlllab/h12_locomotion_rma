@@ -33,12 +33,12 @@ from rma.adaptation_module import Adaptation1DCNN, Adaptation1DCNNCfg
 
 @dataclass
 class Phase2Cfg:
-    history_length: int = 30
-    hidden_dims: tuple[int, ...] = (512, 256, 128)
+    history_length: int = 50              # paper k=50
+    embed_dim: int = 32                    # per-timestep MLP embed
     lr: float = 5e-4
     grad_clip: float = 1.0
     num_steps_per_update: int = 24        # same as PPO's num_steps_per_env for similar data volume
-    num_iterations: int = 5000
+    num_iterations: int = 1000             # paper: 1000 iters
     save_interval: int = 100
     log_interval: int = 10
 
@@ -90,8 +90,14 @@ class RmaPhase2Runner:
             in_channels=self.in_channels,
             history_length=cfg.history_length,
             latent_dim=self.latent_dim,
-            hidden_dims=cfg.hidden_dims,
+            embed_dim=cfg.embed_dim,
         )).to(device)
+
+        # Inner actor-critic (post-encoder). We bypass the wrapper's encoder
+        # at act-time so we can inject the STUDENT's ẑ_t (paper DAgger recipe).
+        self._inner_actor_critic = (
+            self.teacher.actor_critic if hasattr(self.teacher, "actor_critic") else self.teacher
+        )
 
         self.optim = torch.optim.Adam(self.adaptation.parameters(), lr=cfg.lr)
 
@@ -108,18 +114,28 @@ class RmaPhase2Runner:
         self.current_iter = 0
 
     # -------------------------------------------------------------- #
-    #  Teacher rollout (act + recurrent-state reset)
+    #  Rollout policy — base actor-critic conditioned on STUDENT ẑ_t
     # -------------------------------------------------------------- #
-    def _teacher_act(self, obs: torch.Tensor) -> torch.Tensor:
-        """Run the frozen teacher: encode env.rma_et → z_t, LSTM → action."""
-        e_t_norm = normalize_et(self.env.rma_et).to(obs.device)
-        augmented = torch.cat([obs, e_t_norm], dim=-1)
-        return self.teacher.act_inference(augmented)
+    def _student_act(self, obs: torch.Tensor, z_pred: torch.Tensor) -> torch.Tensor:
+        """Run base policy π(x_t, a_{t-1}, ẑ_t) using the student's predicted z.
+
+        Paper Algorithm 1 (Phase 2): `a_t ← π(x_t, a_{t-1}, ẑ_t)`. Bypasses the
+        wrapper's encoder — we inject the student's prediction directly.
+        """
+        augmented = torch.cat([obs, z_pred], dim=-1)
+        return self._inner_actor_critic.act_inference(augmented)
 
     def _reset_teacher_state(self, dones: torch.Tensor) -> None:
-        """Reset LSTM hidden state for terminated envs."""
+        """Reset LSTM hidden state for terminated envs.
+
+        Only reset the actor's memory; the critic LSTM is never run during
+        Phase 2 rollouts so its hidden_states is None and the wrapper's
+        reset() would crash on it.
+        """
         if dones.any():
-            self.teacher.reset(dones)
+            actor_critic = self.teacher.actor_critic if hasattr(self.teacher, "actor_critic") else self.teacher
+            if hasattr(actor_critic, "memory_a") and actor_critic.memory_a.hidden_states is not None:
+                actor_critic.memory_a.reset(dones)
 
     # -------------------------------------------------------------- #
     #  History buffer maintenance
@@ -169,16 +185,19 @@ class RmaPhase2Runner:
                 batch_preds.append(pred_z)
                 batch_targets.append(teacher_z.detach())
 
-                # (3) step the env under TEACHER policy (no grad; env is stateful)
-                with torch.inference_mode():
-                    actions = self._teacher_act(obs)
+                # (3) step the env under BASE POLICY + STUDENT ẑ_t (paper DAgger).
+                # Detach pred_z here so env.step()'s action usage doesn't pull
+                # the adaptation module into the env computation graph.
+                with torch.no_grad():
+                    actions = self._student_act(obs, pred_z.detach())
                 new_obs, _, _, dones, _ = self.env.step(actions)
                 dones = dones.to(self.device)
 
                 # (4) update history with (obs, actions) BEFORE overwriting obs
                 self._push_history(obs, actions)
                 self._zero_history_for_dones(dones)
-                self._reset_teacher_state(dones)
+                with torch.no_grad():
+                    self._reset_teacher_state(dones)
                 obs = new_obs.to(self.device)
                 self.total_steps += self.env.num_envs
 
@@ -235,7 +254,7 @@ class RmaPhase2Runner:
                 "in_channels": self.in_channels,
                 "history_length": self.cfg.history_length,
                 "latent_dim": self.latent_dim,
-                "hidden_dims": list(self.cfg.hidden_dims),
+                "embed_dim": self.cfg.embed_dim,
             },
         }, path)
         print(f"[Phase2] saved checkpoint → {path}")

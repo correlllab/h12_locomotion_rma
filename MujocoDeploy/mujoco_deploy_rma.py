@@ -367,16 +367,23 @@ def main():
             obs_47 = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
             # Encode forces -> z_t (normalize to [-1,1] before encoder)
+            et_dim = int(cfg.get("rma_et_dim", 9))
             if use_encoder and t >= force_start:
-                e_t = np.concatenate([
+                forces = np.concatenate([
                     cfg["torso_force"],
                     cfg["left_wrist_force"],
                     cfg["right_wrist_force"],
                 ]).astype(np.float32)
             else:
-                e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
-
-            e_t_norm = normalize_et_np(e_t)
+                forces = np.zeros(9, dtype=np.float32)
+            forces_norm = normalize_et_np(forces)
+            if et_dim > 9:
+                e_t_norm = np.concatenate([
+                    forces_norm,
+                    np.zeros(et_dim - 9, dtype=np.float32),
+                ])
+            else:
+                e_t_norm = forces_norm
             with torch.no_grad():
                 e_t_tensor = torch.from_numpy(e_t_norm).unsqueeze(0).float()
                 z_t = encoder(e_t_tensor).numpy().squeeze()  # (8,)

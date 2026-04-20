@@ -244,13 +244,20 @@ def run_trial_render(m, policy, encoder, cfg, cond: VideoCondition,
             phase = (t / phase_period) % 1.0
             obs_47, _ = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
+            # Build 26-dim e_t (or 9-dim for legacy): force components followed by
+            # zeros for mass/COM/motor/friction (= midpoints in normalized space).
+            et_dim = int(cfg.get("rma_et_dim", 9))
             if use_encoder and t >= force_start:
-                e_t = np.concatenate([cond.torso_force, cond.left_wrist_force,
-                                      cond.right_wrist_force]).astype(np.float32)
+                forces = np.concatenate([cond.torso_force, cond.left_wrist_force,
+                                         cond.right_wrist_force]).astype(np.float32)
             else:
-                e_t = np.zeros(cfg.get("rma_et_dim", 9), dtype=np.float32)
-
-            e_t_norm = normalize_et_np(e_t)
+                forces = np.zeros(9, dtype=np.float32)
+            forces_norm = normalize_et_np(forces)
+            if et_dim > 9:
+                e_t_norm = np.concatenate([forces_norm,
+                                           np.zeros(et_dim - 9, dtype=np.float32)])
+            else:
+                e_t_norm = forces_norm
             with torch.no_grad():
                 z_t = encoder(torch.from_numpy(e_t_norm).unsqueeze(0).float()).numpy().squeeze()
 

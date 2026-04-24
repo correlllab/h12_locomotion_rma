@@ -1,0 +1,101 @@
+# ============================================================
+# Phase 2 eval config for the new 60N-capped 6k-iter teacher.
+# Exercises the eval improvements: combined grids, structured
+# patterns (aligned/anti-aligned/asymmetric), time-resolved z
+# fidelity, and force profiles (constant / impulse / ramp /
+# sinusoid_1hz).
+#
+# Designed to complete in ~30 min; widen magnitudes and bump
+# spherical_n_samples for the full sweep once this is validated.
+# ============================================================
+
+# --- Model + sim paths (policy/encoder paths here are ignored;
+#     load_phase1 uses --policy_ckpt from the CLI) ---
+policy_path: "exported_weights_m6000/policy.pt"
+encoder_path: "exported_weights_m6000/encoder.pt"
+xml_path: "h1_2/scene.xml"
+
+simulation_dt: 0.0025
+control_decimation: 8
+num_actions: 12
+rma_et_dim: 9
+rma_latent_dim: 8
+
+# PD gains (legs) — same as sweep_config_m6000.yaml
+kps: [200, 200, 200, 300, 40, 40,
+      200, 200, 200, 300, 40, 40]
+kds: [2.5, 2.5, 2.5, 4.0, 2.0, 2.0,
+      2.5, 2.5, 2.5, 4.0, 2.0, 2.0]
+
+# PD gains (upper body)
+kps_arms: [200,
+           50, 50, 50, 50, 20, 20, 20,
+           50, 50, 50, 50, 20, 20, 20]
+kds_arms: [5.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+
+default_angles: [0.0, -0.16, 0.0, 0.36, -0.2, 0.0,
+                 0.0, -0.16, 0.0, 0.36, -0.2, 0.0]
+default_angles_arms: [0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+phase_period: 0.8
+
+# ============================================================
+# SWEEP PARAMETERS
+# ============================================================
+
+eval:
+  duration: 10.0
+  fall_height: 0.5
+  force_start_time: 1.0
+  cmd: [0.5, 0.0, 0.0]
+  tracking_warmup: 2.0
+
+# Single-body sweep — kept coarse so the combined/structured/profile
+# dimensions don't explode the trial count. Trained teacher saw up to
+# 60N; we evaluate in-distribution (up to 30N) plus a light OOD probe.
+sweep_bodies:
+  - name: torso
+    label: "Torso"
+  - name: left_wrist
+    label: "LeftWrist"
+  - name: right_wrist
+    label: "RightWrist"
+
+phase2_magnitudes: [0, 10, 20, 30, 45]
+sweep_mode: "axis"
+
+spherical_n_samples: 4
+spherical_seed: 42
+
+# Combined (3 bodies loaded simultaneously, independent spherical dirs).
+combined_sweeps:
+  - [10, 5, 5]
+  - [20, 10, 10]
+  - [30, 20, 20]
+combined_n_samples: 3
+combined_seed: 123
+
+# Structured multi-body patterns. Axis directions (6 per magnitude).
+structured_patterns:
+  - aligned_wrists
+  - anti_aligned_wrists
+  - asymmetric_left
+  - asymmetric_right
+structured_magnitudes: [15, 25]
+
+# Temporal force profiles. "constant" is the historical default; the
+# three others stress the adaptation module's transient response.
+force_profiles:
+  - constant
+  - impulse
+  - ramp
+  - sinusoid_1hz

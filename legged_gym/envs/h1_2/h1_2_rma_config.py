@@ -163,7 +163,7 @@ class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
     class runner(LeggedRobotCfgPPO.runner):
         policy_class_name = "ActorCriticRecurrent"
         algorithm_class_name = 'PPO'
-        max_iterations = 20000
+        max_iterations = 6000
         run_name = ''
         experiment_name = 'h1_2_rma'
 
@@ -181,5 +181,5 @@ class H1_2RmaRoughCfgPPO(LeggedRobotCfgPPO):
         encoder_rl_lr_scale = 0.1
         # Force curriculum: linearly ramp force magnitude from 0 to
         # max_force over this many iterations.  0 = no curriculum.
-        curriculum_steps = 10000
-        max_force = 100.0
+        curriculum_steps = 6000
+        max_force = 60.0

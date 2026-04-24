@@ -1,0 +1,77 @@
+# Phase 2 STRESS eval config — magnitudes well past the 60N training cap.
+# Only single-body axis + coarse combined. Compact so it fits a few minutes.
+
+policy_path: "exported_weights_m6000/policy.pt"
+encoder_path: "exported_weights_m6000/encoder.pt"
+xml_path: "h1_2/scene.xml"
+
+simulation_dt: 0.0025
+control_decimation: 8
+num_actions: 12
+rma_et_dim: 9
+rma_latent_dim: 8
+
+kps: [200, 200, 200, 300, 40, 40,
+      200, 200, 200, 300, 40, 40]
+kds: [2.5, 2.5, 2.5, 4.0, 2.0, 2.0,
+      2.5, 2.5, 2.5, 4.0, 2.0, 2.0]
+kps_arms: [200,
+           50, 50, 50, 50, 20, 20, 20,
+           50, 50, 50, 50, 20, 20, 20]
+kds_arms: [5.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+           2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+
+default_angles: [0.0, -0.16, 0.0, 0.36, -0.2, 0.0,
+                 0.0, -0.16, 0.0, 0.36, -0.2, 0.0]
+default_angles_arms: [0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0,
+                      0.4, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+phase_period: 0.8
+
+eval:
+  duration: 10.0
+  fall_height: 0.5
+  force_start_time: 1.0
+  cmd: [0.5, 0.0, 0.0]
+  tracking_warmup: 2.0
+
+# OOD magnitudes only (skipping 0 since we already have survival=100% there).
+# 50 is still inside distribution (≤60N); 60 is exactly at edge; 70/80 are OOD.
+sweep_bodies:
+  - name: torso
+    label: "Torso"
+  - name: left_wrist
+    label: "LeftWrist"
+  - name: right_wrist
+    label: "RightWrist"
+
+phase2_magnitudes: [50, 60, 70, 80]
+sweep_mode: "axis"
+spherical_n_samples: 4
+spherical_seed: 42
+
+# Coarser combined grid at higher totals
+combined_sweeps:
+  - [40, 30, 30]
+  - [60, 40, 40]
+  - [80, 50, 50]
+combined_n_samples: 3
+combined_seed: 123
+
+# Just the two most informative structured patterns at stress magnitudes
+structured_patterns:
+  - anti_aligned_wrists
+  - aligned_wrists
+structured_magnitudes: [40, 60, 80]
+
+# Only constant for stress — the profile×mag combinatoric blows up otherwise,
+# and we mainly want survival curves vs. N here.
+force_profiles:
+  - constant

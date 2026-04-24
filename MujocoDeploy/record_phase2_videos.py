@@ -250,8 +250,13 @@ def main():
     parser.add_argument("--tag", type=str, default="phase2_paperfix")
     parser.add_argument("--out_root", type=str,
                         default=os.path.join(_SCRIPT_DIR, "eval_results/phase2_paperfix_stress/videos"))
-    parser.add_argument("--conditions", type=str, nargs="+", required=True,
+    parser.add_argument("--conditions", type=str, nargs="*", default=[],
                         help="body:mag:dir:cmd:seed (e.g. left_wrist:90:+Y:walk:0)")
+    parser.add_argument("--multi_conditions", type=str, nargs="*", default=[],
+                        help=("Multi-body force spec: "
+                              "'label,Tx,Ty,Tz,Lx,Ly,Lz,Rx,Ry,Rz,cmd,seed'. "
+                              "Applies explicit force vectors (N, world frame) "
+                              "to torso | left_wrist | right_wrist simultaneously."))
     parser.add_argument("--duration", type=float, default=8.0)
     parser.add_argument("--force_start", type=float, default=1.0)
     parser.add_argument("--width", type=int, default=720)
@@ -277,6 +282,39 @@ def main():
     cfg["eval"]["force_start_time"] = args.force_start
 
     conditions = [parse_condition(s) for s in args.conditions]
+
+    # Multi-body conditions: label,Tx,Ty,Tz,Lx,Ly,Lz,Rx,Ry,Rz,cmd,seed
+    from MujocoDeploy.record_rma_videos import VideoCondition  # local import, same class
+    for spec in args.multi_conditions:
+        parts = spec.split(",")
+        if len(parts) != 12:
+            raise ValueError(
+                f"--multi_conditions entries must have 12 fields "
+                f"'label,Tx,Ty,Tz,Lx,Ly,Lz,Rx,Ry,Rz,cmd,seed', got {len(parts)}: {spec!r}"
+            )
+        label = parts[0]
+        tf = np.array([float(x) for x in parts[1:4]], dtype=np.float32)
+        lf = np.array([float(x) for x in parts[4:7]], dtype=np.float32)
+        rf = np.array([float(x) for x in parts[7:10]], dtype=np.float32)
+        cmd_tag = parts[10]
+        seed = int(parts[11])
+        if cmd_tag not in COMMANDS:
+            raise ValueError(f"command must be one of {list(COMMANDS)}, got {cmd_tag!r}")
+        total = float(np.linalg.norm(tf) + np.linalg.norm(lf) + np.linalg.norm(rf))
+        cond = VideoCondition(
+            body=label,                                # label is used as the "name prefix"
+            magnitude=total,                           # informational only (goes into cond.name)
+            direction_tag="multi",                     # single tag since directions are per-body
+            command_tag=cmd_tag,
+            seed=seed,
+            torso_force=tf,
+            left_wrist_force=lf,
+            right_wrist_force=rf,
+        )
+        conditions.append(cond)
+
+    if not conditions:
+        raise SystemExit("No conditions provided. Pass --conditions and/or --multi_conditions.")
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
     out_dir = os.path.join(args.out_root, f"{args.tag}__{ts}")

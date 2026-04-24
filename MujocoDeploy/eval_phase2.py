@@ -23,7 +23,7 @@ import argparse
 import csv
 import time
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Tuple
 
 import yaml
 import numpy as np
@@ -50,12 +50,39 @@ from sweep_rma_forces import (
 MODES = ("teacher", "adaptation", "baseline")
 
 
+# Supported temporal force profiles. Returns a scalar in ~[-1, 1] (can be
+# negative for sinusoids, which flips the direction). The "ramp" duration and
+# "impulse" duration are baked in here; adjust if you want finer control.
+def _force_scale(t: float, profile: str, force_start: float) -> float:
+    if t < force_start:
+        return 0.0
+    tau = t - force_start
+    if profile == "constant":
+        return 1.0
+    if profile == "impulse":
+        return 1.0 if tau <= 0.2 else 0.0          # 200 ms step then off
+    if profile == "ramp":
+        return min(1.0, tau / 2.0)                  # linear 0->1 over 2 s
+    if profile == "sinusoid_1hz":
+        return float(np.sin(2.0 * np.pi * 1.0 * tau))
+    if profile == "sinusoid_3hz":
+        return float(np.sin(2.0 * np.pi * 3.0 * tau))
+    raise ValueError(f"unknown force_profile: {profile}")
+
+
+SUPPORTED_PROFILES = ("constant", "impulse", "ramp", "sinusoid_1hz", "sinusoid_3hz")
+
+
 @dataclass
 class EvalTrial:
     torso_force: np.ndarray
     left_wrist_force: np.ndarray
     right_wrist_force: np.ndarray
     label: str
+    # Temporal profile of the applied force. "constant" matches the original
+    # behavior (step on at force_start, stay on). Non-constant profiles test
+    # the adaptation module's transient/bandwidth response.
+    force_profile: str = "constant"
 
 
 @dataclass
@@ -71,6 +98,12 @@ class EvalResult:
     tracking_rmse_xy: float
     mean_orientation_err: float
     mean_z_l2_to_teacher: float   # only meaningful for adaptation/baseline
+    # Adaptation dynamics: mean ||ẑ - z_teacher||₂ in two time windows
+    # (0 = teacher mode doesn't populate these). Captures "how fast φ locks
+    # on" vs "asymptotic fidelity" separately — the paper's Fig. 3 story.
+    z_l2_early: float = 0.0       # mean over first 1s after force onset
+    z_l2_steady: float = 0.0      # mean over last 3s of trial
+    force_profile: str = "constant"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -124,8 +157,14 @@ def load_phase2(adapt_ckpt: str, cfg: dict, device: str):
 def run_trial(
     m_template, policy, encoder, adapt, cfg, trial: EvalTrial,
     mode: str, history_length: int, in_channels: int, device: str,
-) -> EvalResult:
-    """Run one MuJoCo trial under the given mode."""
+) -> Tuple[EvalResult, np.ndarray]:
+    """Run one MuJoCo trial under the given mode.
+
+    Returns:
+        result: EvalResult with scalar summaries.
+        z_l2_trace: (T, 2) ndarray of (time_s, ||ẑ - z_teacher||₂). Empty
+                    for teacher mode (z_t == z_teacher by construction).
+    """
     eval_cfg = cfg["eval"]
     dt = cfg["simulation_dt"]
     decim = cfg["control_decimation"]
@@ -163,6 +202,7 @@ def run_trial(
 
     vx_errors, vy_errors, orientation_errors = [], [], []
     z_l2_to_teacher = []  # only for adaptation/baseline modes
+    z_l2_trace: List[Tuple[float, float]] = []  # (t_s, ||ẑ - z_teacher||₂) per control step
 
     # History buffer for adaptation mode (rolling window of [obs, action])
     history = torch.zeros(1, history_length, in_channels, device=device)
@@ -170,15 +210,18 @@ def run_trial(
     for step in range(n_steps):
         t = step * dt
 
-        # Apply forces
+        # Apply forces. `scale` modulates the base trial force per the
+        # trial's temporal profile (0 before force_start, 1 for "constant",
+        # time-dependent for impulse/ramp/sinusoid).
+        scale = _force_scale(t, trial.force_profile, force_start)
         d.xfrc_applied[:] = 0
-        if t >= force_start:
+        if scale != 0.0:
             if torso_id >= 0:
-                d.xfrc_applied[torso_id, :3] = trial.torso_force
+                d.xfrc_applied[torso_id, :3] = trial.torso_force * scale
             if left_id >= 0:
-                d.xfrc_applied[left_id, :3] = trial.left_wrist_force
+                d.xfrc_applied[left_id, :3] = trial.left_wrist_force * scale
             if right_id >= 0:
-                d.xfrc_applied[right_id, :3] = trial.right_wrist_force
+                d.xfrc_applied[right_id, :3] = trial.right_wrist_force * scale
 
         # Leg PD
         target_dof = action * cfg["action_scale"] + np.array(cfg["default_angles"][:n_leg], dtype=np.float32)
@@ -207,9 +250,13 @@ def run_trial(
             obs_47, proj_grav = compute_obs(d, cfg, action, cmd, phase, n_leg)
 
             # --- Build true e_t (always; needed by teacher and for z_l2 metric) ---
-            if t >= force_start:
-                forces = np.concatenate([trial.torso_force, trial.left_wrist_force,
-                                         trial.right_wrist_force]).astype(np.float32)
+            # `scale` is the same profile-dependent modulator we applied to the
+            # MuJoCo forces a few lines up — keep teacher's e_t in lock-step so
+            # z_teacher reflects the actual instantaneous force.
+            if scale != 0.0:
+                forces = np.concatenate([trial.torso_force * scale,
+                                         trial.left_wrist_force * scale,
+                                         trial.right_wrist_force * scale]).astype(np.float32)
             else:
                 forces = np.zeros(9, dtype=np.float32)
             forces_norm = normalize_et_np(forces)
@@ -232,9 +279,9 @@ def run_trial(
                     raise ValueError(f"unknown mode: {mode}")
 
                 if mode != "teacher":
-                    z_l2_to_teacher.append(
-                        torch.norm(z_t - z_teacher, dim=-1).item()
-                    )
+                    l2_val = torch.norm(z_t - z_teacher, dim=-1).item()
+                    z_l2_to_teacher.append(l2_val)
+                    z_l2_trace.append((float(t), float(l2_val)))
 
                 actor_obs = torch.cat([
                     torch.from_numpy(obs_47).unsqueeze(0).to(device), z_t
@@ -262,11 +309,25 @@ def run_trial(
     mean_orient = float(np.mean(orientation_errors)) if orientation_errors else float("nan")
     mean_zl2 = float(np.mean(z_l2_to_teacher)) if z_l2_to_teacher else 0.0
 
+    # Split the ||ẑ - z||₂(t) trace into early (adaptation speed) and steady
+    # (asymptotic fidelity) windows, defined relative to force onset.
+    z_l2_arr = np.asarray(z_l2_trace, dtype=np.float32) if z_l2_trace else np.zeros((0, 2), dtype=np.float32)
+    if z_l2_arr.size > 0:
+        t_arr = z_l2_arr[:, 0]
+        v_arr = z_l2_arr[:, 1]
+        early_mask = (t_arr >= force_start) & (t_arr <= force_start + 1.0)
+        steady_start = max(force_start + 2.0, eval_cfg["duration"] - 3.0)
+        steady_mask = t_arr >= steady_start
+        z_l2_early = float(np.mean(v_arr[early_mask])) if early_mask.any() else 0.0
+        z_l2_steady = float(np.mean(v_arr[steady_mask])) if steady_mask.any() else 0.0
+    else:
+        z_l2_early = z_l2_steady = 0.0
+
     total_mag = (np.linalg.norm(trial.torso_force) +
                  np.linalg.norm(trial.left_wrist_force) +
                  np.linalg.norm(trial.right_wrist_force))
 
-    return EvalResult(
+    result = EvalResult(
         label=trial.label, mode=mode,
         torso_force=trial.torso_force.tolist(),
         left_wrist_force=trial.left_wrist_force.tolist(),
@@ -277,12 +338,39 @@ def run_trial(
         tracking_rmse_xy=round(rmse_xy, 4),
         mean_orientation_err=round(mean_orient, 4),
         mean_z_l2_to_teacher=round(mean_zl2, 4),
+        z_l2_early=round(z_l2_early, 4),
+        z_l2_steady=round(z_l2_steady, 4),
+        force_profile=trial.force_profile,
     )
+    return result, z_l2_arr
 
 
 # ──────────────────────────────────────────────────────────────
 #  Trial generation (subset of sweep — keep eval focused)
 # ──────────────────────────────────────────────────────────────
+
+# Structured multi-body patterns. Each maps a single reference direction
+# `d` to a (torso, left_wrist, right_wrist) force-direction triple. Magnitude
+# is applied uniformly (so total applied energy scales with # of nonzero bodies).
+#   - aligned_wrists:      both wrists pushed same way (simulates carrying
+#                          a payload forward-of-body in both hands)
+#   - anti_aligned_wrists: wrists pushed opposite (pure yaw torque couple)
+#   - asymmetric_left:     only left wrist loaded (one-handed drag)
+#   - asymmetric_right:    only right wrist loaded
+STRUCTURED_PATTERNS = {
+    "aligned_wrists":      lambda d: (np.zeros(3, dtype=np.float32), d.copy(),      d.copy()),
+    "anti_aligned_wrists": lambda d: (np.zeros(3, dtype=np.float32), d.copy(),     -d.copy()),
+    "asymmetric_left":     lambda d: (np.zeros(3, dtype=np.float32), d.copy(),      np.zeros(3, dtype=np.float32)),
+    "asymmetric_right":    lambda d: (np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32), d.copy()),
+}
+
+STRUCTURED_LABELS = {
+    "aligned_wrists": "AlignedWrists",
+    "anti_aligned_wrists": "AntiAlignedWrists",
+    "asymmetric_left": "AsymLeft",
+    "asymmetric_right": "AsymRight",
+}
+
 
 def generate_trials(cfg, magnitudes_override=None, sweep_mode_override=None) -> List[EvalTrial]:
     trials: List[EvalTrial] = []
@@ -324,7 +412,49 @@ def generate_trials(cfg, magnitudes_override=None, sweep_mode_override=None) -> 
             else:
                 raise ValueError(f"Unknown sweep_mode: {mode}")
 
-    # De-dup zero trials
+    # --- Combined: forces on all 3 bodies at once with independent spherical
+    #     directions. `combined_sweeps` is a list of [torso, left, right]
+    #     magnitude triples. Skipped silently if absent from cfg.
+    combined_sweeps = cfg.get("combined_sweeps", [])
+    if combined_sweeps:
+        cn = cfg.get("combined_n_samples", 3)
+        crng = np.random.default_rng(cfg.get("combined_seed", 123))
+        for combo in combined_sweeps:
+            t_mag, l_mag, r_mag = combo
+            mag_tag = f"{t_mag:g}/{l_mag:g}/{r_mag:g}N"
+            for i in range(cn):
+                dirs = sample_sphere(3, crng)  # independent per body
+                trials.append(EvalTrial(
+                    torso_force=(dirs[0] * t_mag).astype(np.float32),
+                    left_wrist_force=(dirs[1] * l_mag).astype(np.float32),
+                    right_wrist_force=(dirs[2] * r_mag).astype(np.float32),
+                    label=f"Combined|{mag_tag}|sph{i:02d}",
+                ))
+
+    # --- Structured: forces on torso+wrists in a physically-meaningful pattern
+    #     (aligned, anti-aligned, asymmetric) along axis directions. Magnitude
+    #     is the *per-body* scalar; direction is shared or flipped per pattern.
+    structured_patterns = cfg.get("structured_patterns", [])
+    structured_magnitudes = cfg.get("structured_magnitudes", magnitudes)
+    for pname in structured_patterns:
+        if pname not in STRUCTURED_PATTERNS:
+            raise ValueError(f"Unknown structured_pattern '{pname}'. "
+                             f"Choices: {list(STRUCTURED_PATTERNS)}")
+        plabel = STRUCTURED_LABELS[pname]
+        fn = STRUCTURED_PATTERNS[pname]
+        for mag in structured_magnitudes:
+            if mag == 0:
+                continue  # zero-mag duplicate of single-body|0N|zero
+            for dname, dvec in AXIS_DIRECTIONS.items():
+                tf, lf, rf = fn(dvec * float(mag))
+                trials.append(EvalTrial(
+                    torso_force=tf.astype(np.float32),
+                    left_wrist_force=lf.astype(np.float32),
+                    right_wrist_force=rf.astype(np.float32),
+                    label=f"{plabel}|{mag}N|{dname}",
+                ))
+
+    # De-dup zero trials (same label, same zero forces)
     seen = set()
     out = []
     for t in trials:
@@ -332,7 +462,40 @@ def generate_trials(cfg, magnitudes_override=None, sweep_mode_override=None) -> 
             continue
         seen.add(t.label)
         out.append(t)
-    return out
+
+    # --- Force profile expansion. `force_profiles` defaults to just "constant"
+    #     (preserves existing behavior). For each additional profile, replicate
+    #     the non-zero trials under that profile and append its name to the
+    #     label as a 4th component. Zero-force trials aren't duplicated —
+    #     they'd be identical across profiles.
+    profiles = cfg.get("force_profiles", ["constant"])
+    for p in profiles:
+        if p not in SUPPORTED_PROFILES:
+            raise ValueError(f"unknown force_profile '{p}'. Choices: {SUPPORTED_PROFILES}")
+    if profiles == ["constant"]:
+        return out
+
+    expanded: List[EvalTrial] = []
+    for t in out:
+        # Constant profile always emitted with the clean (3-part) label to stay
+        # backward-compatible with existing downstream code / eval result dirs.
+        if "constant" in profiles:
+            expanded.append(t)
+        is_zero = (np.linalg.norm(t.torso_force) + np.linalg.norm(t.left_wrist_force)
+                   + np.linalg.norm(t.right_wrist_force)) < 1e-9
+        if is_zero:
+            continue
+        for p in profiles:
+            if p == "constant":
+                continue
+            expanded.append(EvalTrial(
+                torso_force=t.torso_force.copy(),
+                left_wrist_force=t.left_wrist_force.copy(),
+                right_wrist_force=t.right_wrist_force.copy(),
+                label=f"{t.label}|{p}",
+                force_profile=p,
+            ))
+    return expanded
 
 
 # ──────────────────────────────────────────────────────────────
@@ -348,6 +511,8 @@ CSV_FIELDS = [
     "survival_time", "success",
     "tracking_rmse_xy", "mean_orientation_err",
     "mean_z_l2_to_teacher",
+    "z_l2_early", "z_l2_steady",
+    "force_profile",
 ]
 
 
@@ -362,6 +527,9 @@ def result_to_row(r: EvalResult) -> dict:
         "tracking_rmse_xy": r.tracking_rmse_xy,
         "mean_orientation_err": r.mean_orientation_err,
         "mean_z_l2_to_teacher": r.mean_z_l2_to_teacher,
+        "z_l2_early": r.z_l2_early,
+        "z_l2_steady": r.z_l2_steady,
+        "force_profile": r.force_profile,
     }
 
 
@@ -406,7 +574,7 @@ def print_summary(results: List[EvalResult]):
     for body in bodies:
         print(f"\n  {body}:")
         body_rows = [r for r in results if r.label.startswith(body + "|")]
-        mags = sorted({float(r.label.split("|")[1].replace("N", "")) for r in body_rows})
+        mags = sorted({_mag_key(r.label) for r in body_rows})
         header = "    mag | " + " | ".join(f"{m:>11s}" for m in MODES)
         print(header)
         print("    " + "-" * (len(header) - 4))
@@ -414,12 +582,26 @@ def print_summary(results: List[EvalResult]):
             row = f"    {int(mag):3d}N|"
             for mode in MODES:
                 msub = [r for r in body_rows
-                        if r.mode == mode and float(r.label.split("|")[1].replace("N", "")) == mag]
+                        if r.mode == mode and _mag_key(r.label) == mag]
                 n_s = sum(1 for r in msub if r.success)
                 n_t = len(msub)
                 row += f"  {n_s:>3d}/{n_t:<3d} ({100*n_s/n_t if n_t else 0:5.1f}%)"
             print(row)
     print("\n" + "=" * 78)
+
+
+def _mag_key(label: str) -> float:
+    """Parse magnitude from a label like 'Torso|15N|+X' or 'Combined|10/5/5N|sph00'.
+    For combined tags, returns the SUM of the component magnitudes (so plots can
+    sort consistently across single-body and combined conditions)."""
+    try:
+        tag = label.split("|")[1].rstrip("N")
+    except IndexError:
+        return 0.0
+    try:
+        return sum(float(x) for x in tag.split("/"))
+    except ValueError:
+        return 0.0
 
 
 def plot_results(csv_path: str, out_dir: str):
@@ -448,7 +630,7 @@ def plot_results(csv_path: str, out_dir: str):
                          if r["mode"] == mode and r["label"].startswith(body + "|")]
             mag_succ = {}
             for r in mode_rows:
-                mag = float(r["label"].split("|")[1].replace("N", ""))
+                mag = _mag_key(r["label"])
                 mag_succ.setdefault(mag, []).append(r["success"] == "True")
             if not mag_succ:
                 continue
@@ -479,7 +661,7 @@ def plot_results(csv_path: str, out_dir: str):
                          and r["success"] == "True"]
             mag_track = {}
             for r in mode_rows:
-                mag = float(r["label"].split("|")[1].replace("N", ""))
+                mag = _mag_key(r["label"])
                 val = float(r["tracking_rmse_xy"])
                 if not np.isnan(val):
                     mag_track.setdefault(mag, []).append(val)
@@ -506,7 +688,7 @@ def plot_results(csv_path: str, out_dir: str):
         mode_rows = [r for r in rows if r["mode"] == mode]
         mag_zl2 = {}
         for r in mode_rows:
-            mag = float(r["label"].split("|")[1].replace("N", ""))
+            mag = _mag_key(r["label"])
             mag_zl2.setdefault(mag, []).append(float(r["mean_z_l2_to_teacher"]))
         if not mag_zl2:
             continue
@@ -523,6 +705,73 @@ def plot_results(csv_path: str, out_dir: str):
     p3 = os.path.join(out_dir, "phase2_z_fidelity.png")
     plt.savefig(p3, dpi=150); plt.close()
     print(f"  Saved: {p3}")
+
+
+def plot_adaptation_curves(traces_path: str, out_dir: str, force_start: float = 1.0,
+                           duration: float = 10.0):
+    """Mean ± std ||ẑ - z_teacher||₂(t) per mode, averaged across all trials.
+
+    This is the Kumar et al. 2021 Fig. 3 story: how fast does the student
+    latent converge to the teacher's after force onset? Plots t on a common
+    grid from force_start-0.5 to end-of-trial; traces shorter than that (i.e.
+    the robot fell) are treated as missing past their last timestep.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    if not os.path.exists(traces_path):
+        print(f"  [adaptation_curves] no traces at {traces_path}; skipping")
+        return
+
+    npz = np.load(traces_path)
+    # Group keys by mode (key format: "{label}__{mode}")
+    by_mode: Dict[str, List[np.ndarray]] = {}
+    for k in npz.files:
+        mode = k.rsplit("__", 1)[-1]
+        by_mode.setdefault(mode, []).append(npz[k])
+    if not by_mode:
+        print(f"  [adaptation_curves] traces file is empty; skipping")
+        return
+
+    # Resample to a common time grid so we can mean/std across trials.
+    grid = np.linspace(max(0.0, force_start - 0.5), duration, 200, dtype=np.float32)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for mode in ("adaptation", "baseline"):
+        if mode not in by_mode:
+            continue
+        stacked = []
+        for trace in by_mode[mode]:
+            if trace.shape[0] < 2:
+                continue
+            t, v = trace[:, 0], trace[:, 1]
+            # Only interpolate within the actually-recorded t-range; leave NaN
+            # outside so falls don't bias tails toward zero.
+            y = np.interp(grid, t, v, left=np.nan, right=np.nan)
+            stacked.append(y)
+        if not stacked:
+            continue
+        arr = np.stack(stacked, axis=0)
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        color = {"adaptation": "C1", "baseline": "C3"}[mode]
+        ax.plot(grid, mean, "-", color=color, label=f"{mode} (N={arr.shape[0]})")
+        ax.fill_between(grid, mean - std, mean + std, color=color, alpha=0.2)
+
+    ax.axvline(force_start, ls="--", color="gray", lw=1, label="force onset")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel(r"$\|\hat z - z_{teacher}\|_2$")
+    ax.set_title("Phase 2 adaptation dynamics (mean ± std across trials)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    p = os.path.join(out_dir, "phase2_adaptation_curves.png")
+    plt.savefig(p, dpi=150)
+    plt.close()
+    print(f"  Saved: {p}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -542,6 +791,9 @@ def main():
                         help="Override force magnitudes (e.g. --magnitudes 20 30 40 50 60 70 80 90 100)")
     parser.add_argument("--sweep_mode", type=str, default=None, choices=["axis", "spherical"],
                         help="Override sweep_mode from config")
+    parser.add_argument("--force_profiles", type=str, nargs="+", default=None,
+                        choices=list(SUPPORTED_PROFILES),
+                        help="Override config force_profiles (default: 'constant' only).")
     args = parser.parse_args()
 
     device = args.device
@@ -580,6 +832,8 @@ def main():
     m = mujoco.MjModel.from_xml_path(cfg["xml_path"])
     m.opt.timestep = cfg["simulation_dt"]
 
+    if args.force_profiles is not None:
+        cfg["force_profiles"] = args.force_profiles
     trials = generate_trials(cfg, magnitudes_override=args.magnitudes,
                              sweep_mode_override=args.sweep_mode)
     print(f"\nTotal force trials: {len(trials)}  (× 3 modes = {len(trials)*3} runs)")
@@ -589,14 +843,19 @@ def main():
 
     # Run all (trial × mode)
     results: List[EvalResult] = []
+    # Per-trial z-L2 traces keyed by f"{label}__{mode}", only non-empty
+    # for adaptation/baseline modes. Saved alongside the CSV as NPZ.
+    traces: Dict[str, np.ndarray] = {}
     t0 = time.time()
     total = len(trials) * len(MODES)
     n_done = 0
     for trial in trials:
         for mode in MODES:
-            r = run_trial(m, policy, encoder, adapt, cfg, trial, mode,
-                          history_length, in_channels, device)
+            r, z_trace = run_trial(m, policy, encoder, adapt, cfg, trial, mode,
+                                   history_length, in_channels, device)
             results.append(r)
+            if z_trace.size > 0:
+                traces[f"{r.label}__{r.mode}"] = z_trace
             n_done += 1
             elapsed = time.time() - t0
             eta = elapsed / n_done * (total - n_done)
@@ -607,8 +866,23 @@ def main():
 
     write_csv(results, csv_path)
     print(f"\nResults: {csv_path}")
+
+    # Dump all z-L2 traces as a single NPZ. Each key is f"{label}__{mode}"
+    # with a (T, 2) array of (time_s, ||ẑ-z_teacher||₂). Teacher mode is
+    # omitted because z_t == z_teacher by construction.
+    traces_path = ""
+    if traces:
+        traces_path = os.path.join(out_dir, "z_l2_traces.npz")
+        np.savez_compressed(traces_path, **traces)
+        print(f"Traces : {traces_path} ({len(traces)} series)")
     print_summary(results)
     plot_results(csv_path, out_dir)
+    if traces_path:
+        plot_adaptation_curves(
+            traces_path, out_dir,
+            force_start=cfg["eval"].get("force_start_time", 0.0),
+            duration=cfg["eval"]["duration"],
+        )
     print(f"\nAll outputs in: {out_dir}/")
 
 

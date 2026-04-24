@@ -1,0 +1,62 @@
+%% Run LaTeX on this file several times to get Table of Contents,
+%% cross-references, and citations.
+
+\documentclass[11pt]{book}
+\usepackage{Wiley-AuthoringTemplate}
+\usepackage{chapterbib}
+\usepackage[sectionbib,authoryear]{natbib}% for name-date citation comment the below line
+%\usepackage[sectionbib,numbers]{natbib}% for numbered citation comment the above line
+\usepackage{outlines}
+
+%%********************************************************************%%
+%%       The below macro controls the numbering of section heads      %%
+%% 0= no section numbers, 1= section, 2= subsection, 3= subsubsection %%
+\setcounter{secnumdepth}{3}
+%%********************************************************************%%
+
+%%**********************************************************************%%
+%%  The below macro controls the number of section heads displayed in   %%
+%%			Table of Contents?				%%
+%% 0= chapter, 1= section, 2= subsection, 3= subsubsection titles.	%%
+\setcounter{tocdepth}{2}
+%%**********************************************************************%%
+
+
+%%**********************************************************************%%
+% Added package for humanoid locomotion chapter
+\usepackage{booktabs}
+\usepackage{tabularx}
+
+%%**********************************************************************%%
+
+
+%%\includeonly{fm}
+
+\makeindex% for index generation
+\usepackage{xcolor}
+\newcommand{\nc}[1]{{\color{purple} Nithin: #1}}
+\newcommand{\ak}[1]{{\color{red} Aditi: #1}}
+\newcommand{\yd}[1]{{\color{brown} Yiheng: #1}}
+\newcommand{\sr}[1]{{\color{blue} Sanjeev: #1}}
+
+\begin{document}
+
+\frontmatter
+%\include{fm}
+
+\mainmatter
+%\include{p01}
+\include{ch01}
+%\include{ch02} 
+%\include{p02}
+%\include{ch03} 
+%\include{ch04}
+%\include{ch05}
+
+%\backmatter
+%\include{app01}
+%\include{app02}
+
+\printindex
+
+\end{document}
